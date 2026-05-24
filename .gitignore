@@ -1,0 +1,24 @@
+# Rust build artifacts
+/target
+
+# Per-run state — generated at runtime, never committed
+.flux-runs/
+
+# Personal data — lives outside the repo, but exclude defensively
+.flux-private/
+
+# Environment files — API keys live here, never committed
+.env
+.env.*
+
+# Logs
+*.log
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
