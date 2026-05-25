@@ -1,0 +1,40 @@
+[workflow]
+name = "paper-compare"
+description = "Find and compare recent papers on a research topic"
+
+[budget]
+max_usd = 1.50
+
+[inputs]
+topic = { description = "Research topic to search for and compare papers on" }
+
+[[steps]]
+id = "find"
+model = "claude-sonnet-4-6"
+prompt = """
+Search for two or three recent influential papers on this topic: {{ topic }}
+
+For each paper, note: title, authors, year, publication venue, and core contribution.
+"""
+tools = ["web_search"]
+max_tool_calls = 5
+
+[[steps]]
+id = "compare"
+depends_on = ["find"]
+model = "claude-sonnet-4-6"
+prompt = """
+You found these papers on the topic of {{ topic }}:
+
+{{ find.output }}
+
+Compare them directly. Cover:
+1. What problem does each paper solve, and how?
+2. How do their approaches differ in methodology?
+3. Key results — where does each excel?
+4. Limitations — what does each leave unresolved?
+5. Synthesis — if you had to choose one to build on, which and why?
+"""
+
+[output]
+step = "compare"

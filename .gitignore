@@ -4,8 +4,12 @@
 # Per-run state — generated at runtime, never committed
 .flux-runs/
 
+# Final outputs — personal content, never committed
+outputs/
+
 # Personal data — lives outside the repo, but exclude defensively
 .flux-private/
+flux-private/
 
 # Environment files — API keys live here, never committed
 .env
@@ -23,6 +27,7 @@
 *.swp
 *.swo
 
-# Claude Code project instructions — personal context, not for public repo
+# Claude Code project instructions and session planning docs — personal context, not for public repo
 Claude.MD
 CLAUDE.md
+0*.MD

@@ -1,4 +1,5 @@
 use assert_cmd::Command;
+use predicates::str::contains;
 
 fn flux() -> Command {
     Command::cargo_bin("flux").expect("flux binary not found")
@@ -39,5 +40,33 @@ fn run_rejects_conflicting_input_flags() {
             "foo.txt",
         ])
         .assert()
-        .failure(); 
+        .failure();
+}
+
+#[test]
+fn validate_accepts_valid_workflow() {
+    flux()
+        .args(["validate", "examples/paper-compare.toml"])
+        .assert()
+        .success()
+        .stdout(contains("is valid"));
+}
+
+#[test]
+fn validate_rejects_missing_file() {
+    flux()
+        .args(["validate", "no-such-file.toml"])
+        .assert()
+        .failure();
+}
+
+#[test]
+fn explain_shows_workflow_structure() {
+    flux()
+        .args(["explain", "examples/paper-compare.toml"])
+        .assert()
+        .success()
+        .stdout(contains("paper-compare"))
+        .stdout(contains("find"))
+        .stdout(contains("compare"));
 }
