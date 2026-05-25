@@ -22,3 +22,7 @@
 .idea/
 *.swp
 *.swo
+
+# Claude Code project instructions — personal context, not for public repo
+Claude.MD
+CLAUDE.md
