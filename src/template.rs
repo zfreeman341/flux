@@ -20,7 +20,11 @@ pub fn render_prompt(
         ctx.insert(id.clone(), json!({"output": output}));
     }
 
-    Environment::new()
-        .render_str(template, Value::Object(ctx))
+    let mut env = Environment::new();
+    // Strict mode: referencing an undefined variable is an error, not silent empty string.
+    // Without this, {{ item }} in a prompt that wasn't given an item renders as "",
+    // producing a confused LLM response rather than a clear template error.
+    env.set_undefined_behavior(minijinja::UndefinedBehavior::Strict);
+    env.render_str(template, Value::Object(ctx))
         .map_err(|e| crate::FluxError::Template(e.to_string()))
 }

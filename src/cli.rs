@@ -25,15 +25,19 @@ pub struct RunArgs {
     /// Path to the workflow TOML file
     pub workflow: PathBuf,
 
-    /// Input text passed directly to the workflow
-    #[arg(long, conflicts_with = "input_file")]
-    pub input: Option<String>,
+    /// Input key=value pair; may be repeated for multiple inputs.
+    /// A bare value (no '=') maps to key "input".
+    /// Example: --input sector="legal AI" --input role="engineer"
+    #[arg(long = "input")]
+    pub inputs: Vec<String>,
 
-    /// Read workflow input from a file
-    #[arg(long, conflicts_with = "input")]
-    pub input_file: Option<PathBuf>,
+    /// Read an input from a file as key=path; may be repeated.
+    /// A bare path (no '=') maps to key "input".
+    /// Example: --input-file resume=~/.flux-private/data/resume.md
+    #[arg(long = "input-file")]
+    pub input_files: Vec<String>,
 
-    /// Write output to a file instead of stdout
+    /// Write output to a file instead of the default outputs/ directory
     #[arg(long)]
     pub output: Option<PathBuf>,
 
@@ -52,12 +56,4 @@ pub struct ValidateArgs {
 pub struct ExplainArgs {
     /// Path to the workflow TOML file
     pub workflow: PathBuf,
-
-    /// Input text passed directly to the workflow
-    #[arg(long, conflicts_with = "input_file")]
-    pub input: Option<String>,
-
-    /// Read workflow input from a file
-    #[arg(long, conflicts_with = "input")]
-    pub input_file: Option<PathBuf>,
 }

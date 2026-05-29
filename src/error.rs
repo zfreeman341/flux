@@ -25,6 +25,9 @@ pub enum FluxError {
 
     #[error("budget exceeded: spent ${spent:.4} of ${limit:.4} limit")]
     BudgetExceeded { spent: f64, limit: f64 },
+
+    #[error("agent error: {0}")]
+    Agent(String),
 }
 
 pub type Result<T> = std::result::Result<T, FluxError>;

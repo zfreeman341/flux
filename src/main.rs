@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -41,7 +42,9 @@ async fn run(args: flux::cli::RunArgs) -> Result<()> {
 
     let client =
         flux::anthropic::AnthropicClient::from_env().context("failed to init Anthropic client")?;
-    let engine = flux::engine::Engine::new(Box::new(client));
+    // Default agent provider is claude-code; switch to hermes if you have it installed.
+    let agent = Arc::new(flux::agent::CliAgentProvider::claude_code());
+    let engine = flux::engine::Engine::new(Box::new(client), agent);
     let mut budget = flux::engine::BudgetTracker::new(wf.budget.max_usd);
 
     let result = engine
@@ -81,16 +84,31 @@ async fn run(args: flux::cli::RunArgs) -> Result<()> {
 fn build_inputs(args: &flux::cli::RunArgs) -> Result<HashMap<String, String>> {
     let mut inputs = HashMap::new();
 
-    if let Some(text) = &args.input {
-        let (key, value) = split_key_value(text);
+    for kv in &args.inputs {
+        let (key, value) = split_key_value(kv);
         inputs.insert(key, value);
-    } else if let Some(path) = &args.input_file {
-        let content = std::fs::read_to_string(path)
-            .with_context(|| format!("failed to read {}", path.display()))?;
-        inputs.insert("input".to_string(), content);
+    }
+
+    for kf in &args.input_files {
+        let (key, raw_path) = split_key_value(kf);
+        // Expand leading '~' to the home directory so callers can write
+        // --input-file resume=~/.flux-private/data/resume.md naturally.
+        let expanded = expand_tilde(&raw_path);
+        let content = std::fs::read_to_string(&expanded)
+            .with_context(|| format!("failed to read input file '{}'", expanded))?;
+        inputs.insert(key, content);
     }
 
     Ok(inputs)
+}
+
+fn expand_tilde(path: &str) -> String {
+    if let Some(rest) = path.strip_prefix("~/")
+        && let Some(home) = std::env::var_os("HOME")
+    {
+        return format!("{}/{}", home.to_string_lossy(), rest);
+    }
+    path.to_string()
 }
 
 // "key=value" splits on first '='; a plain string maps to key "input".
@@ -241,18 +259,29 @@ fn explain(args: flux::cli::ExplainArgs) -> Result<()> {
 
     for (i, step) in wf.steps.iter().enumerate() {
         println!("Step {}: {}", i + 1, step.id);
-        println!("  Model:  {}", step.model);
+        match step.provider.as_deref() {
+            Some(p) if p != "anthropic" => println!("  Provider: {p}"),
+            _ => println!("  Model:    {}", step.model),
+        }
+        if let Some(ref upstream) = step.parallel_over {
+            let concurrency = step.max_concurrent.unwrap_or(3);
+            let cap = step
+                .max_items
+                .map(|n| format!(", max {n} items"))
+                .unwrap_or_default();
+            println!("  Fan-out:  over '{upstream}' (max {concurrency} concurrent{cap})");
+        }
         if !step.depends_on.is_empty() {
-            println!("  Deps:   {}", step.depends_on.join(", "));
+            println!("  Deps:     {}", step.depends_on.join(", "));
         }
         if !step.tools.is_empty() {
             let cap = step
                 .max_tool_calls
                 .map(|n| format!(" (max {n})"))
                 .unwrap_or_default();
-            println!("  Tools:  {}{cap}", step.tools.join(", "));
+            println!("  Tools:    {}{cap}", step.tools.join(", "));
         }
-        println!("  Prompt: {} chars", step.prompt.len());
+        println!("  Prompt:   {} chars", step.prompt.len());
         println!();
     }
 
