@@ -7,6 +7,8 @@ pub fn validate_workflow(wf: &WorkflowFile) -> crate::Result<()> {
     check_unique_ids(wf)?;
     check_depends_on_refs(wf)?;
     check_no_cycles(wf)?;
+    check_providers(wf)?;
+    check_parallel_over(wf)?;
     Ok(())
 }
 
@@ -40,6 +42,45 @@ fn check_depends_on_refs(wf: &WorkflowFile) -> crate::Result<()> {
                 return Err(FluxError::Config(format!(
                     "step '{}' depends_on '{}', which does not exist",
                     step.id, dep
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+const VALID_PROVIDERS: &[&str] = &["anthropic", "hermes", "claude-code"];
+
+fn check_providers(wf: &WorkflowFile) -> crate::Result<()> {
+    for step in &wf.steps {
+        if let Some(ref p) = step.provider
+            && !VALID_PROVIDERS.contains(&p.as_str())
+        {
+            return Err(FluxError::Config(format!(
+                "step '{}' has unknown provider '{}' (valid: {})",
+                step.id,
+                p,
+                VALID_PROVIDERS.join(", ")
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn check_parallel_over(wf: &WorkflowFile) -> crate::Result<()> {
+    let ids: HashSet<&str> = wf.steps.iter().map(|s| s.id.as_str()).collect();
+    for step in &wf.steps {
+        if let Some(ref upstream) = step.parallel_over {
+            if !ids.contains(upstream.as_str()) {
+                return Err(FluxError::Config(format!(
+                    "step '{}' parallel_over '{}', which does not exist",
+                    step.id, upstream
+                )));
+            }
+            if !step.depends_on.iter().any(|d| d == upstream) {
+                return Err(FluxError::Config(format!(
+                    "step '{}' parallel_over '{}' but '{}' is not listed in depends_on",
+                    step.id, upstream, upstream
                 )));
             }
         }

@@ -145,11 +145,7 @@ async fn send_with_retries(
                 .unwrap_or_else(|| 2u64.pow(attempt))
                 .min(MAX_RETRY_DELAY_SECS);
 
-            warn!(
-                attempt,
-                delay_secs,
-                "rate limited, retrying"
-            );
+            warn!(attempt, delay_secs, "rate limited, retrying");
             sleep(Duration::from_secs(delay_secs)).await;
             attempt += 1;
             continue;

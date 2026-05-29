@@ -41,6 +41,9 @@ pub struct Step {
     pub max_tool_calls: Option<u32>,
     pub parallel_over: Option<String>,
     pub max_concurrent: Option<usize>,
+    pub max_items: Option<usize>,
+    pub provider: Option<String>,
+    pub cost_per_call_usd: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
