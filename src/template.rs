@@ -21,10 +21,11 @@ pub fn render_prompt(
     }
 
     let mut env = Environment::new();
-    // Strict mode: referencing an undefined variable is an error, not silent empty string.
-    // Without this, {{ item }} in a prompt that wasn't given an item renders as "",
-    // producing a confused LLM response rather than a clear template error.
-    env.set_undefined_behavior(minijinja::UndefinedBehavior::Strict);
+    // Lenient mode: undefined variables render as empty string instead of erroring.
+    // This prevents a missing reads_from file or a first-run empty state variable
+    // from aborting the entire workflow. Typos in variable names produce silent
+    // empty output rather than a crash — catch them by inspecting step output.
+    env.set_undefined_behavior(minijinja::UndefinedBehavior::Lenient);
     env.render_str(template, Value::Object(ctx))
         .map_err(|e| crate::FluxError::Template(e.to_string()))
 }

@@ -1,7 +1,9 @@
 use std::collections::{HashMap, HashSet};
+use std::io::Write;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use chrono::Utc;
 use futures::future::join_all;
 use tokio::sync::Semaphore;
 use tracing::{info, instrument, warn};
@@ -59,18 +61,26 @@ impl Engine {
         for step in sorted {
             let step_start = Instant::now();
 
+            // Augment the base inputs with any state file contents declared in reads_from.
+            // Each key in reads_from becomes a template variable for this step's prompt.
+            let step_inputs = load_state_for_step(step, inputs)?;
+
+            // Snapshot budget before this step so we can refund a parallel pre-charge
+            // if the step gets budget-killed before any agents actually run.
+            let pre_step_spent = budget.spent_usd;
+
             let attempt = if let Some(ref upstream_id) = step.parallel_over {
-                self.run_parallel(step, upstream_id, inputs, &step_outputs, budget, step_start)
+                self.run_parallel(step, upstream_id, &step_inputs, &step_outputs, budget, step_start)
                     .await
             } else {
                 let provider = step.provider.as_deref().unwrap_or("anthropic");
                 match provider {
                     "hermes" | "claude-code" => {
-                        self.run_single_agent(step, inputs, &step_outputs, budget, step_start)
+                        self.run_single_agent(step, &step_inputs, &step_outputs, budget, step_start)
                             .await
                     }
                     _ => {
-                        self.run_llm(step, inputs, &step_outputs, budget, step_start)
+                        self.run_llm(step, &step_inputs, &step_outputs, budget, step_start)
                             .await
                     }
                 }
@@ -84,9 +94,23 @@ impl Engine {
             let step_result = match attempt {
                 Ok(r) => r,
                 Err(FluxError::BudgetExceeded { spent, limit }) => {
+                    // Parallel steps pre-charge for all N items before any agent runs.
+                    // If that pre-charge itself caused the budget exceeded, no real
+                    // money was spent — refund it so reported spend stays honest.
+                    if step.parallel_over.is_some() {
+                        let phantom = spent - pre_step_spent;
+                        if phantom > 0.0 {
+                            budget.refund(phantom);
+                            warn!(
+                                step = %step.id,
+                                refunded = format!("{:.4}", phantom),
+                                "refunded parallel pre-charge: no agents ran"
+                            );
+                        }
+                    }
                     warn!(
                         step = %step.id,
-                        spent = format!("{:.4}", spent),
+                        spent = format!("{:.4}", budget.spent_usd),
                         limit = format!("{:.4}", limit),
                         "budget exceeded; skipping step and attempting partial synthesis"
                     );
@@ -105,8 +129,36 @@ impl Engine {
                         duration: step_start.elapsed(),
                     }
                 }
+                // Template errors mean a variable was missing or malformed.
+                // Rather than aborting the whole run, inject a clear placeholder
+                // so downstream steps (the synthesizer) still produce output.
+                Err(FluxError::Template(ref msg)) => {
+                    warn!(step = %step.id, error = %msg, "template error; skipping step with placeholder");
+                    StepResult {
+                        id: step.id.clone(),
+                        model: step.provider.clone().unwrap_or_else(|| step.model.clone()),
+                        prompt: String::new(),
+                        output: format!(
+                            "[SKIPPED — template error in step '{}': {msg}. \
+                             Check that all {{{{ variable }}}} references are defined.]",
+                            step.id
+                        ),
+                        input_tokens: 0,
+                        output_tokens: 0,
+                        cost_usd: 0.0,
+                        duration: step_start.elapsed(),
+                    }
+                }
                 Err(e) => return Err(e),
             };
+
+            // Append the step's output to the configured state file, if any.
+            // Failure here is non-fatal — warn loudly but don't abort the run.
+            if let Some(ref path) = step.appends_to
+                && let Err(e) = append_to_state(path, &step_result.output, &workflow.workflow.name, &step.id)
+            {
+                warn!(step = %step.id, path = %path, error = %e, "failed to append to state file");
+            }
 
             step_outputs.insert(step.id.clone(), step_result.output.clone());
             step_results.push(step_result);
@@ -195,6 +247,7 @@ impl Engine {
             .agent
             .run(AgentRequest {
                 task: prompt.clone(),
+                timeout_secs: step.timeout_secs.unwrap_or(60),
             })
             .await?;
 
@@ -236,16 +289,18 @@ impl Engine {
             ))
         })?;
 
-        // Strip lines that are clearly prose rather than list items.
-        // LLMs sometimes output reasoning text before the actual list despite
-        // format instructions. Lines over 80 chars are almost certainly sentences,
-        // not names. This filter runs before max_items so the cap applies to
-        // real items, not to noise lines.
+        // Strip lines that are clearly decorative rather than list items:
+        // blank lines, markdown headers, and lines with no alphanumeric content
+        // (e.g. "---", "==="). We also strip leading list markers ("- ", "* ",
+        // "1. ") so planners that add bullets still produce clean items.
+        // The old heuristic (len <= 80) was wrong for structured output like
+        // "Company | Role | https://..." which can be well over 80 chars.
         let mut items: Vec<String> = upstream_output
             .lines()
             .filter(|l| !l.trim().is_empty())
-            .filter(|l| l.trim().len() <= 80)
-            .map(|l| l.trim().to_string())
+            .filter(|l| !l.trim_start().starts_with('#'))
+            .filter(|l| l.trim().chars().any(|c| c.is_alphanumeric()))
+            .map(|l| strip_list_marker(l.trim()).to_string())
             .collect();
 
         if items.is_empty() {
@@ -302,6 +357,9 @@ impl Engine {
         // it increments an atomic counter, no heap allocation.
         let agent = Arc::clone(&self.agent);
         let step_id = step.id.clone();
+        // Capture as a plain u64 so it can be copied into each async move block
+        // without needing a clone or borrow. u64 is Copy.
+        let timeout_secs = step.timeout_secs.unwrap_or(60);
 
         // Build the Vec of futures without spawning threads. join_all polls them
         // concurrently on the current task. Since the actual work (subprocess) is
@@ -319,7 +377,7 @@ impl Engine {
                     // unwrap() is safe here: the semaphore is never closed.
                     let _permit = sem.acquire().await.unwrap();
                     info!(step = %step_id, item = %item, "agent call start");
-                    let result = agent.run(AgentRequest { task: prompt }).await;
+                    let result = agent.run(AgentRequest { task: prompt, timeout_secs }).await;
                     (item, result)
                 }
             })
@@ -404,6 +462,107 @@ impl BudgetTracker {
     pub fn enable_emergency(&mut self) {
         self.emergency = true;
     }
+
+    // Rolls back a phantom pre-charge. Used when a parallel step pre-charges
+    // for N agent calls but gets budget-killed before any agent actually runs —
+    // the reported spend should reflect real API calls, not a failed estimate.
+    pub fn refund(&mut self, amount: f64) {
+        self.spent_usd -= amount;
+    }
+}
+
+// Loads state files declared in a step's reads_from map and merges them into
+// a copy of base_inputs. Missing files produce a warning and inject an empty
+// string so first-run workflows work before any state has been accumulated.
+fn load_state_for_step(
+    step: &crate::workflow::Step,
+    base_inputs: &HashMap<String, String>,
+) -> crate::Result<HashMap<String, String>> {
+    if step.reads_from.is_empty() {
+        return Ok(base_inputs.clone());
+    }
+    let mut inputs = base_inputs.clone();
+    for (var_name, raw_path) in &step.reads_from {
+        let path = crate::expand_tilde(raw_path);
+        match read_state_path(&path) {
+            Ok(Some(content)) => {
+                inputs.insert(var_name.clone(), content);
+            }
+            Ok(None) => {
+                warn!(
+                    step = %step.id,
+                    var = %var_name,
+                    path = %path,
+                    "state path not found or empty; injecting empty string"
+                );
+                inputs.insert(var_name.clone(), String::new());
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(inputs)
+}
+
+// Reads a state path that may be either a file or a directory.
+// For a file: returns its contents, or None if it doesn't exist.
+// For a directory: returns the contents of the most recently modified file
+// in the directory, or None if the directory is empty or doesn't exist.
+fn read_state_path(path: &str) -> crate::Result<Option<String>> {
+    let p = std::path::Path::new(path);
+
+    if p.is_dir() {
+        let mut entries: Vec<_> = std::fs::read_dir(p)?
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().is_file())
+            .collect();
+
+        // Sort by modification time so the most recent file is last.
+        entries.sort_by_key(|e| {
+            e.metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+        });
+
+        match entries.last() {
+            Some(entry) => {
+                let file_path = entry.path();
+                info!(path = %file_path.display(), "reading most recent file from state directory");
+                Ok(Some(std::fs::read_to_string(&file_path)?))
+            }
+            None => Ok(None),
+        }
+    } else {
+        match std::fs::read_to_string(p) {
+            Ok(content) => Ok(Some(content)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(crate::FluxError::Io(e)),
+        }
+    }
+}
+
+// Appends a step's output to a state file with a timestamped header.
+// Creates the file (and any parent directories) if it doesn't exist.
+fn append_to_state(
+    raw_path: &str,
+    output: &str,
+    workflow_name: &str,
+    step_id: &str,
+) -> crate::Result<()> {
+    let path = crate::expand_tilde(raw_path);
+    if let Some(parent) = std::path::Path::new(&path).parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let timestamp = Utc::now().format("%Y-%m-%d %H:%M UTC").to_string();
+    let entry = format!(
+        "\n\n---\n\n_Added {timestamp} by `{workflow_name}` / step `{step_id}`_\n\n{output}\n"
+    );
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)?;
+    file.write_all(entry.as_bytes())?;
+    info!(step = %step_id, path = %path, "appended output to state file");
+    Ok(())
 }
 
 // Exposed so main.rs can show per-step cost without re-implementing the formula.
@@ -438,6 +597,25 @@ fn model_pricing(model: &str) -> (f64, f64) {
     } else {
         (3.0, 15.0)
     }
+}
+
+// Strips common markdown list markers from the start of a line so planners
+// that add bullets ("- Harvey", "1. Harvey") still produce clean item strings.
+fn strip_list_marker(s: &str) -> &str {
+    // Numbered: "1. ", "12. "
+    if let Some(rest) = s.split_once(". ")
+        && rest.0.chars().all(|c| c.is_ascii_digit())
+        && !rest.0.is_empty()
+    {
+        return rest.1;
+    }
+    // Unordered: "- ", "* ", "• "
+    for prefix in &["- ", "* ", "• "] {
+        if let Some(rest) = s.strip_prefix(prefix) {
+            return rest;
+        }
+    }
+    s
 }
 
 // Returns steps in execution order: every step appears after all its dependencies.

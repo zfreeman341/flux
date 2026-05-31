@@ -20,7 +20,6 @@ pub struct CliAgentProvider {
     // Args inserted between the binary and the task string.
     // e.g., ["-p"] for claude, ["-z"] for hermes.
     args: Vec<String>,
-    timeout: Duration,
 }
 
 impl CliAgentProvider {
@@ -28,7 +27,6 @@ impl CliAgentProvider {
         Self {
             binary: binary.into(),
             args,
-            timeout: Duration::from_secs(300),
         }
     }
 
@@ -59,7 +57,7 @@ impl AgentProvider for CliAgentProvider {
         // doesn't complete within the duration, it returns Err(Elapsed).
         // We map that into our own FluxError::Agent before surfacing it.
         let result = tokio::time::timeout(
-            self.timeout,
+            Duration::from_secs(request.timeout_secs),
             tokio::process::Command::new(&self.binary)
                 .args(&self.args)
                 .arg(&request.task)
@@ -75,7 +73,7 @@ impl AgentProvider for CliAgentProvider {
                 return Err(FluxError::Agent(format!(
                     "{} timed out after {}s",
                     self.binary,
-                    self.timeout.as_secs()
+                    request.timeout_secs,
                 )));
             }
             Ok(Err(e)) => {

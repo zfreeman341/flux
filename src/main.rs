@@ -93,7 +93,7 @@ fn build_inputs(args: &flux::cli::RunArgs) -> Result<HashMap<String, String>> {
         let (key, raw_path) = split_key_value(kf);
         // Expand leading '~' to the home directory so callers can write
         // --input-file resume=~/.flux-private/data/resume.md naturally.
-        let expanded = expand_tilde(&raw_path);
+        let expanded = flux::expand_tilde(&raw_path);
         let content = std::fs::read_to_string(&expanded)
             .with_context(|| format!("failed to read input file '{}'", expanded))?;
         inputs.insert(key, content);
@@ -102,20 +102,26 @@ fn build_inputs(args: &flux::cli::RunArgs) -> Result<HashMap<String, String>> {
     Ok(inputs)
 }
 
-fn expand_tilde(path: &str) -> String {
-    if let Some(rest) = path.strip_prefix("~/")
-        && let Some(home) = std::env::var_os("HOME")
-    {
-        return format!("{}/{}", home.to_string_lossy(), rest);
-    }
-    path.to_string()
-}
-
 // "key=value" splits on first '='; a plain string maps to key "input".
 fn split_key_value(s: &str) -> (String, String) {
     match s.split_once('=') {
         Some((k, v)) => (k.to_string(), v.to_string()),
         None => ("input".to_string(), s.to_string()),
+    }
+}
+
+fn resolve_output_dir(output_dir: &Option<String>) -> PathBuf {
+    match output_dir {
+        None => PathBuf::from("outputs"),
+        Some(dir) => {
+            let expanded = flux::expand_tilde(dir);
+            let p = std::path::Path::new(&expanded);
+            if p.is_absolute() {
+                p.to_path_buf()
+            } else {
+                PathBuf::from("outputs").join(&expanded)
+            }
+        }
     }
 }
 
@@ -130,22 +136,19 @@ fn write_run_artifacts(
         .unwrap_or_default()
         .as_secs();
 
-    // outputs/{workflow-name}-{input-slug}-{ts}.md
-    // This gives each file a meaningful, human-readable name rather than
-    // just a timestamp, so you can tell at a glance what a run was about.
     let input_slug = inputs
         .values()
         .next()
         .map(|v| {
-            // Take first 40 chars of the first input value, slugify.
             let truncated: String = v.chars().take(40).collect();
             format!("-{}", slugify(&truncated))
         })
         .unwrap_or_default();
     let output_filename = format!("{}{}-{}.md", slugify(&wf.workflow.name), input_slug, ts);
 
-    std::fs::create_dir_all("outputs")?;
-    let output_path = PathBuf::from("outputs").join(&output_filename);
+    let out_dir = resolve_output_dir(&wf.workflow.output_dir);
+    std::fs::create_dir_all(&out_dir)?;
+    let output_path = out_dir.join(&output_filename);
 
     let output_md = format!(
         "# {name}\n\n{desc}**Cost:** ${cost:.4}  \n**Duration:** {dur:.1}s\n\n---\n\n{output}\n",
