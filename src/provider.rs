@@ -32,6 +32,7 @@ pub trait AgentProvider: Send + Sync {
 
 pub struct AgentRequest {
     pub task: String,
+    pub timeout_secs: u64,
 }
 
 pub struct AgentResponse {
