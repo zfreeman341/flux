@@ -30,9 +30,25 @@ impl CliAgentProvider {
         }
     }
 
-    // Factory: `claude -p "<task>"`
+    // Factory: `claude -p --allowedTools=WebFetch,WebSearch "<task>"`
+    //
+    // --allowedTools pre-approves WebFetch and WebSearch so agents running
+    // as subprocesses don't hit permission prompts. Without this, agents
+    // trying to fetch career pages block or time out waiting for approval
+    // that can never come in non-interactive mode.
+    //
+    // The flag MUST use the --flag=value form (not --flag value). The claude
+    // CLI defines --allowedTools as variadic (<tools...>), so a bare
+    // `--allowedTools WebFetch,WebSearch "<task>"` consumes the task string
+    // as a second tool name and leaves the prompt argument missing.
     pub fn claude_code() -> Self {
-        Self::new("claude", vec!["-p".to_string()])
+        Self::new(
+            "claude",
+            vec![
+                "-p".to_string(),
+                "--allowedTools=WebFetch,WebSearch".to_string(),
+            ],
+        )
     }
 
     // Factory: `hermes -z "<task>"`
@@ -49,6 +65,17 @@ impl AgentProvider for CliAgentProvider {
     async fn run(&self, request: AgentRequest) -> crate::Result<AgentResponse> {
         let start = Instant::now();
 
+        // Prepend an efficiency note: if a page is unreachable, move on rather
+        // than retrying indefinitely. This avoids agents spending their entire
+        // budget stuck on one unresponsive site. Deliberately avoids mentioning
+        // specific time values — telling an LLM "stop at 240 seconds" causes it
+        // to over-research trying to fill a perceived window, then get cut off.
+        let task = format!(
+            "[Be efficient: if a page is slow or unreachable, skip it and move on. \
+             Prioritise producing complete output over exhaustive coverage.]\n\n{}",
+            request.task,
+        );
+
         // tokio::process::Command is the async version of std::process::Command.
         // It doesn't block the thread while the subprocess runs — the runtime
         // polls it like any other future, so other tasks can make progress.
@@ -60,7 +87,7 @@ impl AgentProvider for CliAgentProvider {
             Duration::from_secs(request.timeout_secs),
             tokio::process::Command::new(&self.binary)
                 .args(&self.args)
-                .arg(&request.task)
+                .arg(&task)
                 .output(),
         )
         .await;
