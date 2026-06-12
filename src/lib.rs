@@ -4,6 +4,7 @@ pub mod cli;
 pub mod cost;
 pub mod engine;
 pub mod error;
+pub mod estimate;
 pub mod parser;
 pub mod provider;
 pub mod template;

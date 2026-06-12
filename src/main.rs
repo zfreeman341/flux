@@ -247,6 +247,8 @@ fn explain(args: flux::cli::ExplainArgs) -> Result<()> {
         .with_context(|| format!("failed to parse {}", args.workflow.display()))?;
     flux::validator::validate_workflow(&wf).context("workflow validation failed")?;
 
+    let estimate = flux::estimate::estimate_workflow(&wf);
+
     println!("Workflow: {}", wf.workflow.name);
     if let Some(desc) = &wf.workflow.description {
         println!("Description: {desc}");
@@ -260,7 +262,7 @@ fn explain(args: flux::cli::ExplainArgs) -> Result<()> {
     }
     println!();
 
-    for (i, step) in wf.steps.iter().enumerate() {
+    for ((i, step), est) in wf.steps.iter().enumerate().zip(&estimate.steps) {
         println!("Step {}: {}", i + 1, step.id);
         match step.provider.as_deref() {
             Some(p) if p != "anthropic" => println!("  Provider: {p}"),
@@ -285,10 +287,25 @@ fn explain(args: flux::cli::ExplainArgs) -> Result<()> {
             println!("  Tools:    {}{cap}", step.tools.join(", "));
         }
         println!("  Prompt:   {} chars", step.prompt.len());
+        println!("  Est cost: ~${:.2}", est.cost_usd);
+        if !est.assumptions.is_empty() {
+            println!("            ({})", est.assumptions.join("; "));
+        }
         println!();
     }
 
     println!("Output step: {}", wf.output.step);
+    println!(
+        "Estimated total: ~${:.2} of ${:.2} budget",
+        estimate.total_usd, wf.budget.max_usd
+    );
+    if estimate.total_usd > wf.budget.max_usd {
+        println!(
+            "WARNING: estimate exceeds budget — `flux run` would likely abort mid-workflow. \
+             Raise budget.max_usd or shrink the workflow."
+        );
+    }
+    println!("(Estimates are heuristic: pre-run token counts and fan-out sizes are unknown.)");
     Ok(())
 }
 
