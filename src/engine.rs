@@ -69,8 +69,8 @@ impl Engine {
             // if the step gets budget-killed before any agents actually run.
             let pre_step_spent = budget.spent_usd;
 
-            let attempt = if let Some(ref upstream_id) = step.parallel_over {
-                self.run_parallel(step, upstream_id, &step_inputs, &step_outputs, budget, step_start)
+            let attempt = if step.parallel_over.is_some() || !step.parallel_items.is_empty() {
+                self.run_parallel(step, &step_inputs, &step_outputs, budget, step_start)
                     .await
             } else {
                 let provider = step.provider.as_deref().unwrap_or("anthropic");
@@ -247,7 +247,7 @@ impl Engine {
             .agent
             .run(AgentRequest {
                 task: prompt.clone(),
-                timeout_secs: step.timeout_secs.unwrap_or(60),
+                timeout_secs: step.timeout_secs.unwrap_or(300),
             })
             .await?;
 
@@ -271,44 +271,53 @@ impl Engine {
         })
     }
 
-    // Fans out over every line in the upstream step's output, running one
-    // agent call per item with bounded concurrency.
+    // Fans out over a list of items, running one agent call per item with bounded
+    // concurrency. Items come from either parallel_items (static TOML list) or by
+    // parsing the output of the upstream step named in parallel_over.
     async fn run_parallel(
         &self,
         step: &Step,
-        upstream_id: &str,
         inputs: &HashMap<String, String>,
         step_outputs: &HashMap<String, String>,
         budget: &mut BudgetTracker,
         step_start: Instant,
     ) -> crate::Result<StepResult> {
-        let upstream_output = step_outputs.get(upstream_id).ok_or_else(|| {
-            FluxError::Config(format!(
-                "step '{}' parallel_over '{}' which has not yet run",
-                step.id, upstream_id
-            ))
-        })?;
+        // Resolve items from whichever source is configured. parallel_items takes
+        // a static list directly from the TOML; parallel_over parses lines from
+        // an upstream step's output. The validator guarantees exactly one is set.
+        let mut items: Vec<String> = if !step.parallel_items.is_empty() {
+            step.parallel_items.clone()
+        } else {
+            let upstream_id = step.parallel_over.as_deref().unwrap();
+            let upstream_output = step_outputs.get(upstream_id).ok_or_else(|| {
+                FluxError::Config(format!(
+                    "step '{}' parallel_over '{}' which has not yet run",
+                    step.id, upstream_id
+                ))
+            })?;
 
-        // Strip lines that are clearly decorative rather than list items:
-        // blank lines, markdown headers, and lines with no alphanumeric content
-        // (e.g. "---", "==="). We also strip leading list markers ("- ", "* ",
-        // "1. ") so planners that add bullets still produce clean items.
-        // The old heuristic (len <= 80) was wrong for structured output like
-        // "Company | Role | https://..." which can be well over 80 chars.
-        let mut items: Vec<String> = upstream_output
-            .lines()
-            .filter(|l| !l.trim().is_empty())
-            .filter(|l| !l.trim_start().starts_with('#'))
-            .filter(|l| l.trim().chars().any(|c| c.is_alphanumeric()))
-            .map(|l| strip_list_marker(l.trim()).to_string())
-            .collect();
+            // Strip lines that are clearly decorative rather than list items:
+            // blank lines, markdown headers, and lines with no alphanumeric content
+            // (e.g. "---", "==="). We also strip leading list markers ("- ", "* ",
+            // "1. ") so planners that add bullets still produce clean items.
+            // The old heuristic (len <= 80) was wrong for structured output like
+            // "Company | Role | https://..." which can be well over 80 chars.
+            let parsed: Vec<String> = upstream_output
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .filter(|l| !l.trim_start().starts_with('#'))
+                .filter(|l| l.trim().chars().any(|c| c.is_alphanumeric()))
+                .map(|l| strip_list_marker(l.trim()).to_string())
+                .collect();
 
-        if items.is_empty() {
-            return Err(FluxError::Config(format!(
-                "step '{}' parallel_over '{}' produced no items to fan out over",
-                step.id, upstream_id
-            )));
-        }
+            if parsed.is_empty() {
+                return Err(FluxError::Config(format!(
+                    "step '{}' parallel_over '{}' produced no items to fan out over",
+                    step.id, upstream_id
+                )));
+            }
+            parsed
+        };
 
         // max_items caps the fan-out so a chatty planner output doesn't pre-charge
         // the budget for 25 items when you only wanted 6. The planner may output
@@ -359,7 +368,7 @@ impl Engine {
         let step_id = step.id.clone();
         // Capture as a plain u64 so it can be copied into each async move block
         // without needing a clone or borrow. u64 is Copy.
-        let timeout_secs = step.timeout_secs.unwrap_or(60);
+        let timeout_secs = step.timeout_secs.unwrap_or(300);
 
         // Build the Vec of futures without spawning threads. join_all polls them
         // concurrently on the current task. Since the actual work (subprocess) is
@@ -384,6 +393,22 @@ impl Engine {
             .collect();
 
         let results = join_all(futures).await;
+
+        // Refund pre-charged cost for every call that failed. The pre-charge
+        // prevents over-committing the budget before agents fire, but a failed
+        // call (bad invocation, immediate exit, permission error) incurs no real
+        // API spend — don't report it as money spent.
+        let failed_count = results.iter().filter(|(_, r)| r.is_err()).count();
+        if failed_count > 0 {
+            let refund = resolve_cost(step, failed_count);
+            budget.refund(refund);
+            warn!(
+                step = %step.id,
+                failed = failed_count,
+                refunded_usd = format!("{:.4}", refund),
+                "refunding pre-charged cost for failed agent calls"
+            );
+        }
 
         let mut output_parts: Vec<String> = Vec::new();
         for (item, result) in results {

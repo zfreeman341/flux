@@ -46,6 +46,11 @@ pub struct Step {
     pub tools: Vec<String>,
     pub max_tool_calls: Option<u32>,
     pub parallel_over: Option<String>,
+    /// Static list of items to fan out over. Alternative to parallel_over when
+    /// the items are known at workflow-authoring time and don't need a model step
+    /// to generate them. Cannot be combined with parallel_over.
+    #[serde(default)]
+    pub parallel_items: Vec<String>,
     pub max_concurrent: Option<usize>,
     pub max_items: Option<usize>,
     pub provider: Option<String>,

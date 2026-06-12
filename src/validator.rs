@@ -70,6 +70,14 @@ fn check_providers(wf: &WorkflowFile) -> crate::Result<()> {
 fn check_parallel_over(wf: &WorkflowFile) -> crate::Result<()> {
     let ids: HashSet<&str> = wf.steps.iter().map(|s| s.id.as_str()).collect();
     for step in &wf.steps {
+        // parallel_over and parallel_items are mutually exclusive.
+        if step.parallel_over.is_some() && !step.parallel_items.is_empty() {
+            return Err(FluxError::Config(format!(
+                "step '{}' cannot set both parallel_over and parallel_items",
+                step.id
+            )));
+        }
+
         if let Some(ref upstream) = step.parallel_over {
             if !ids.contains(upstream.as_str()) {
                 return Err(FluxError::Config(format!(
