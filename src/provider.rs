@@ -21,6 +21,9 @@ pub struct CompletionResponse {
     pub content: String,
     pub input_tokens: u32,
     pub output_tokens: u32,
+    /// Web searches the server executed during this request. Billed per call
+    /// on top of tokens, so cost tracking needs the count.
+    pub web_search_requests: u32,
 }
 
 // --- Agent provider (shells out to an external agent CLI) ---

@@ -88,6 +88,10 @@ impl LlmProvider for AnthropicClient {
             content: extract_text(&response.content),
             input_tokens: response.usage.input_tokens,
             output_tokens: response.usage.output_tokens,
+            web_search_requests: response
+                .usage
+                .server_tool_use
+                .map_or(0, |t| t.web_search_requests),
         })
     }
 }
@@ -198,4 +202,16 @@ struct ContentBlock {
 struct Usage {
     input_tokens: u32,
     output_tokens: u32,
+    // Only present when server tools (web_search, web_fetch) ran during the
+    // request. Option + #[serde(default)] keeps deserialization tolerant:
+    // a missing field becomes None instead of an error.
+    #[serde(default)]
+    server_tool_use: Option<ServerToolUse>,
+}
+
+#[derive(Deserialize)]
+struct ServerToolUse {
+    // default covers responses where only web_fetch ran and this key is absent.
+    #[serde(default)]
+    web_search_requests: u32,
 }

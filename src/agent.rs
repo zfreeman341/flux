@@ -99,8 +99,7 @@ impl AgentProvider for CliAgentProvider {
             Err(_elapsed) => {
                 return Err(FluxError::Agent(format!(
                     "{} timed out after {}s",
-                    self.binary,
-                    request.timeout_secs,
+                    self.binary, request.timeout_secs,
                 )));
             }
             Ok(Err(e)) => {

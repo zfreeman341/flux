@@ -1,6 +1,7 @@
 pub mod agent;
 pub mod anthropic;
 pub mod cli;
+pub mod cost;
 pub mod engine;
 pub mod error;
 pub mod parser;

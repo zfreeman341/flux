@@ -10,6 +10,7 @@ use tracing::{info, instrument, warn};
 
 use crate::{
     FluxError,
+    cost::{self, BudgetTracker},
     provider::{AgentProvider, AgentRequest, CompletionRequest, LlmProvider},
     workflow::{Step, WorkflowFile},
 };
@@ -155,7 +156,8 @@ impl Engine {
             // Append the step's output to the configured state file, if any.
             // Failure here is non-fatal — warn loudly but don't abort the run.
             if let Some(ref path) = step.appends_to
-                && let Err(e) = append_to_state(path, &step_result.output, &workflow.workflow.name, &step.id)
+                && let Err(e) =
+                    append_to_state(path, &step_result.output, &workflow.workflow.name, &step.id)
             {
                 warn!(step = %step.id, path = %path, error = %e, "failed to append to state file");
             }
@@ -202,7 +204,12 @@ impl Engine {
             })
             .await?;
 
-        let cost = step_cost_usd(&step.model, response.input_tokens, response.output_tokens);
+        let cost = cost::call_cost_usd(
+            &step.model,
+            response.input_tokens,
+            response.output_tokens,
+            response.web_search_requests,
+        );
         budget.add(cost)?;
 
         let duration = step_start.elapsed();
@@ -239,7 +246,7 @@ impl Engine {
         let provider_name = step.provider.as_deref().unwrap_or("agent");
         info!(step = %step.id, provider = %provider_name, "executing agent step");
 
-        let cost = resolve_cost(step, 1);
+        let cost = cost::resolve_cost(step, 1);
         budget.add(cost)?;
 
         let prompt = crate::template::render_prompt(&step.prompt, inputs, step_outputs)?;
@@ -336,7 +343,7 @@ impl Engine {
         }
 
         let n = items.len();
-        let cost = resolve_cost(step, n);
+        let cost = cost::resolve_cost(step, n);
         budget.add(cost)?;
 
         info!(step = %step.id, items = n, "starting parallel fan-out");
@@ -386,7 +393,12 @@ impl Engine {
                     // unwrap() is safe here: the semaphore is never closed.
                     let _permit = sem.acquire().await.unwrap();
                     info!(step = %step_id, item = %item, "agent call start");
-                    let result = agent.run(AgentRequest { task: prompt, timeout_secs }).await;
+                    let result = agent
+                        .run(AgentRequest {
+                            task: prompt,
+                            timeout_secs,
+                        })
+                        .await;
                     (item, result)
                 }
             })
@@ -400,7 +412,7 @@ impl Engine {
         // API spend — don't report it as money spent.
         let failed_count = results.iter().filter(|(_, r)| r.is_err()).count();
         if failed_count > 0 {
-            let refund = resolve_cost(step, failed_count);
+            let refund = cost::resolve_cost(step, failed_count);
             budget.refund(refund);
             warn!(
                 step = %step.id,
@@ -451,48 +463,6 @@ impl Engine {
             cost_usd: cost,
             duration,
         })
-    }
-}
-
-pub struct BudgetTracker {
-    pub limit_usd: f64,
-    pub spent_usd: f64,
-    // When true, add() accumulates cost but never errors. Enabled after a step
-    // is skipped due to budget so the output step can still synthesize partial results.
-    emergency: bool,
-}
-
-impl BudgetTracker {
-    pub fn new(limit_usd: f64) -> Self {
-        Self {
-            limit_usd,
-            spent_usd: 0.0,
-            emergency: false,
-        }
-    }
-
-    pub fn add(&mut self, cost: f64) -> crate::Result<()> {
-        self.spent_usd += cost;
-        if self.spent_usd > self.limit_usd && !self.emergency {
-            return Err(FluxError::BudgetExceeded {
-                spent: self.spent_usd,
-                limit: self.limit_usd,
-            });
-        }
-        Ok(())
-    }
-
-    // Called when a step is skipped due to BudgetExceeded so subsequent steps
-    // (specifically the output/synthesizer step) can still run.
-    pub fn enable_emergency(&mut self) {
-        self.emergency = true;
-    }
-
-    // Rolls back a phantom pre-charge. Used when a parallel step pre-charges
-    // for N agent calls but gets budget-killed before any agent actually runs —
-    // the reported spend should reflect real API calls, not a failed estimate.
-    pub fn refund(&mut self, amount: f64) {
-        self.spent_usd -= amount;
     }
 }
 
@@ -588,40 +558,6 @@ fn append_to_state(
     file.write_all(entry.as_bytes())?;
     info!(step = %step_id, path = %path, "appended output to state file");
     Ok(())
-}
-
-// Exposed so main.rs can show per-step cost without re-implementing the formula.
-pub fn step_cost_usd(model: &str, input_tokens: u32, output_tokens: u32) -> f64 {
-    let (input_price, output_price) = model_pricing(model);
-    (input_tokens as f64 * input_price + output_tokens as f64 * output_price) / 1_000_000.0
-}
-
-// Resolves cost for agent steps. Warns if not set so authors know it's estimated.
-fn resolve_cost(step: &Step, count: usize) -> f64 {
-    let per_call = match step.cost_per_call_usd {
-        Some(c) => c,
-        None => {
-            warn!(
-                step = %step.id,
-                "cost_per_call_usd not set; estimating $0.05 per call"
-            );
-            0.05
-        }
-    };
-    per_call * count as f64
-}
-
-// Approximate pricing per million tokens (input, output) as of 2026.
-fn model_pricing(model: &str) -> (f64, f64) {
-    if model.contains("opus") {
-        (15.0, 75.0)
-    } else if model.contains("sonnet") {
-        (3.0, 15.0)
-    } else if model.contains("haiku") {
-        (0.80, 4.0)
-    } else {
-        (3.0, 15.0)
-    }
 }
 
 // Strips common markdown list markers from the start of a line so planners

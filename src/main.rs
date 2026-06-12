@@ -45,7 +45,7 @@ async fn run(args: flux::cli::RunArgs) -> Result<()> {
     // Default agent provider is claude-code; switch to hermes if you have it installed.
     let agent = Arc::new(flux::agent::CliAgentProvider::claude_code());
     let engine = flux::engine::Engine::new(Box::new(client), agent);
-    let mut budget = flux::engine::BudgetTracker::new(wf.budget.max_usd);
+    let mut budget = flux::cost::BudgetTracker::new(wf.budget.max_usd);
 
     let result = engine
         .run(&wf, &inputs, &mut budget)
