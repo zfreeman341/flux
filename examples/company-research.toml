@@ -1,0 +1,58 @@
+[workflow]
+name = "Company Research"
+description = "Generates a company list, researches each in parallel via an agent, then synthesizes."
+# output_dir places results in outputs/company-research/ instead of the flat outputs/ directory.
+# Omit to use the default outputs/ directory.
+output_dir = "company-research"
+
+[budget]
+max_usd = 2.00
+
+[inputs]
+input = { description = "A research topic or company category to investigate" }
+
+[[steps]]
+id = "planner"
+model = "claude-haiku-4-5-20251001"
+prompt = """
+Generate a list of 6 companies to research related to: {{ input }}
+
+Output one company name per line. Nothing else — no numbers, no bullets, just names.
+"""
+
+[[steps]]
+id = "researcher"
+provider = "claude-code"
+parallel_over = "planner"
+max_concurrent = 3
+depends_on = ["planner"]
+cost_per_call_usd = 0.10
+prompt = """
+Research {{ item }}. Write a concise summary (200-300 words) covering:
+- What they build and who their customers are
+- Engineering team size and primary tech stack
+- Funding status and recent notable news
+- Any interesting technical problems they are working on
+"""
+
+[[steps]]
+id = "synthesize"
+model = "claude-sonnet-4-6"
+depends_on = ["researcher"]
+# appends_to writes this step's output to a file after it succeeds.
+# The file is created if it doesn't exist; each run appends with a timestamp header.
+# Uncomment and set a path to accumulate research across runs:
+# appends_to = "~/.flux-private/data/company-notes.md"
+prompt = """
+Here are research summaries for each company:
+
+{{ researcher.output }}
+
+Based on this research and the original topic ({{ input }}), write a structured analysis:
+- Which companies are most technically interesting and why
+- Common patterns across the space
+- Notable outliers or surprises
+"""
+
+[output]
+step = "synthesize"
