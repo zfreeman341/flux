@@ -610,3 +610,79 @@ fn dfs_topo<'a>(
     }
     result.push(by_id[id]);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Deserialize from TOML instead of writing 15-field struct literals —
+    // exercises the same parse path real workflows use.
+    fn step(src: &str) -> Step {
+        toml::from_str(src).expect("test step TOML should parse")
+    }
+
+    fn position(sorted: &[&Step], id: &str) -> usize {
+        sorted
+            .iter()
+            .position(|s| s.id == id)
+            .unwrap_or_else(|| panic!("step '{id}' missing from sort output"))
+    }
+
+    #[test]
+    fn topo_sort_puts_dependencies_before_dependents() {
+        let steps = vec![
+            step("id = \"synth\"\nprompt = \"p\"\ndepends_on = [\"research\"]"),
+            step("id = \"research\"\nprompt = \"p\"\ndepends_on = [\"plan\"]"),
+            step("id = \"plan\"\nprompt = \"p\""),
+        ];
+        let sorted = topological_sort(&steps);
+        assert_eq!(sorted.len(), 3);
+        assert!(position(&sorted, "plan") < position(&sorted, "research"));
+        assert!(position(&sorted, "research") < position(&sorted, "synth"));
+    }
+
+    #[test]
+    fn topo_sort_handles_diamond() {
+        // a -> (b, c) -> d, declared in scrambled order.
+        let steps = vec![
+            step("id = \"d\"\nprompt = \"p\"\ndepends_on = [\"b\", \"c\"]"),
+            step("id = \"b\"\nprompt = \"p\"\ndepends_on = [\"a\"]"),
+            step("id = \"c\"\nprompt = \"p\"\ndepends_on = [\"a\"]"),
+            step("id = \"a\"\nprompt = \"p\""),
+        ];
+        let sorted = topological_sort(&steps);
+        assert_eq!(sorted.len(), 4);
+        assert!(position(&sorted, "a") < position(&sorted, "b"));
+        assert!(position(&sorted, "a") < position(&sorted, "c"));
+        assert!(position(&sorted, "b") < position(&sorted, "d"));
+        assert!(position(&sorted, "c") < position(&sorted, "d"));
+    }
+
+    #[test]
+    fn topo_sort_keeps_independent_steps() {
+        let steps = vec![
+            step("id = \"x\"\nprompt = \"p\""),
+            step("id = \"y\"\nprompt = \"p\""),
+        ];
+        let sorted = topological_sort(&steps);
+        assert_eq!(sorted.len(), 2);
+    }
+
+    #[test]
+    fn strip_list_marker_handles_bullets_and_numbers() {
+        assert_eq!(strip_list_marker("- Acme"), "Acme");
+        assert_eq!(strip_list_marker("* Acme"), "Acme");
+        assert_eq!(strip_list_marker("• Acme"), "Acme");
+        assert_eq!(strip_list_marker("1. Acme"), "Acme");
+        assert_eq!(strip_list_marker("12. Acme"), "Acme");
+    }
+
+    #[test]
+    fn strip_list_marker_leaves_plain_text_alone() {
+        assert_eq!(strip_list_marker("Acme"), "Acme");
+        // No space after the dot: not a list marker.
+        assert_eq!(strip_list_marker("1.Acme"), "1.Acme");
+        // Non-numeric prefix before ". " is content, not a marker.
+        assert_eq!(strip_list_marker("Inc. Acme"), "Inc. Acme");
+    }
+}

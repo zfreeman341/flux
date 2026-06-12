@@ -72,6 +72,16 @@ fn explain_shows_workflow_structure() {
 }
 
 #[test]
+fn explain_shows_cost_estimate() {
+    flux()
+        .args(["explain", "examples/company-research.toml"])
+        .assert()
+        .success()
+        .stdout(contains("Est cost:"))
+        .stdout(contains("Estimated total:"));
+}
+
+#[test]
 fn validate_accepts_agent_workflow() {
     flux()
         .args(["validate", "examples/company-research.toml"])

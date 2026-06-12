@@ -100,3 +100,69 @@ pub fn model_pricing(model: &str) -> (f64, f64) {
         (3.0, 15.0)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Direct float equality is fine here: the inputs are chosen so the
+    // arithmetic is exact in f64 (powers of ten, no accumulated error).
+    const EPS: f64 = 1e-9;
+
+    #[test]
+    fn add_under_limit_succeeds() {
+        let mut budget = BudgetTracker::new(1.0);
+        assert!(budget.add(0.5).is_ok());
+        assert!((budget.spent_usd - 0.5).abs() < EPS);
+    }
+
+    #[test]
+    fn add_exactly_at_limit_succeeds() {
+        // The check is strictly greater-than: spending the full budget is allowed.
+        let mut budget = BudgetTracker::new(1.0);
+        assert!(budget.add(1.0).is_ok());
+    }
+
+    #[test]
+    fn add_over_limit_errors_but_still_records_spend() {
+        let mut budget = BudgetTracker::new(1.0);
+        let err = budget.add(1.5).unwrap_err();
+        assert!(matches!(err, FluxError::BudgetExceeded { .. }));
+        // The cost is recorded even when the limit trips — callers refund
+        // explicitly when no real spend happened (parallel pre-charge).
+        assert!((budget.spent_usd - 1.5).abs() < EPS);
+    }
+
+    #[test]
+    fn emergency_mode_accumulates_without_erroring() {
+        let mut budget = BudgetTracker::new(1.0);
+        budget.enable_emergency();
+        assert!(budget.add(5.0).is_ok());
+        assert!((budget.spent_usd - 5.0).abs() < EPS);
+    }
+
+    #[test]
+    fn refund_rolls_back_spend() {
+        let mut budget = BudgetTracker::new(10.0);
+        budget.add(3.0).unwrap();
+        budget.refund(2.0);
+        assert!((budget.spent_usd - 1.0).abs() < EPS);
+        // Refund frees headroom: this would have exceeded without it.
+        assert!(budget.add(9.0).is_ok());
+    }
+
+    #[test]
+    fn token_pricing_matches_published_rates() {
+        // 1M input + 1M output tokens at haiku rates = $1 + $5.
+        assert!((step_cost_usd("claude-haiku-4-5", 1_000_000, 1_000_000) - 6.0).abs() < EPS);
+        // Unknown model falls back to sonnet pricing ($3 + $15).
+        assert!((step_cost_usd("mystery-model", 1_000_000, 1_000_000) - 18.0).abs() < EPS);
+    }
+
+    #[test]
+    fn call_cost_adds_web_search_surcharge() {
+        let without = call_cost_usd("claude-sonnet-4-6", 10_000, 1_000, 0);
+        let with = call_cost_usd("claude-sonnet-4-6", 10_000, 1_000, 3);
+        assert!((with - without - 3.0 * WEB_SEARCH_COST_PER_CALL_USD).abs() < EPS);
+    }
+}

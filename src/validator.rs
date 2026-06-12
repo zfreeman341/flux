@@ -134,3 +134,190 @@ fn dfs<'a>(
     visited.insert(id);
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn wf(src: &str) -> WorkflowFile {
+        toml::from_str(src).expect("test workflow TOML should parse")
+    }
+
+    // Asserts validation fails and the error message names the problem,
+    // so a future refactor can't silently swap which check fired.
+    fn assert_rejects(src: &str, expected_in_message: &str) {
+        let err = validate_workflow(&wf(src)).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains(expected_in_message),
+            "expected error containing '{expected_in_message}', got: {msg}"
+        );
+    }
+
+    const VALID: &str = r#"
+[workflow]
+name = "test"
+[budget]
+max_usd = 1.0
+[[steps]]
+id = "a"
+prompt = "p"
+[[steps]]
+id = "b"
+prompt = "p"
+depends_on = ["a"]
+[output]
+step = "b"
+"#;
+
+    #[test]
+    fn accepts_valid_workflow() {
+        assert!(validate_workflow(&wf(VALID)).is_ok());
+    }
+
+    #[test]
+    fn rejects_zero_budget() {
+        assert_rejects(
+            r#"
+[workflow]
+name = "t"
+[budget]
+max_usd = 0.0
+[[steps]]
+id = "a"
+prompt = "p"
+[output]
+step = "a"
+"#,
+            "max_usd",
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_step_ids() {
+        assert_rejects(
+            r#"
+[workflow]
+name = "t"
+[budget]
+max_usd = 1.0
+[[steps]]
+id = "a"
+prompt = "p"
+[[steps]]
+id = "a"
+prompt = "p"
+[output]
+step = "a"
+"#,
+            "duplicate step id",
+        );
+    }
+
+    #[test]
+    fn rejects_missing_dependency() {
+        assert_rejects(
+            r#"
+[workflow]
+name = "t"
+[budget]
+max_usd = 1.0
+[[steps]]
+id = "a"
+prompt = "p"
+depends_on = ["ghost"]
+[output]
+step = "a"
+"#,
+            "does not exist",
+        );
+    }
+
+    #[test]
+    fn rejects_cycle() {
+        assert_rejects(
+            r#"
+[workflow]
+name = "t"
+[budget]
+max_usd = 1.0
+[[steps]]
+id = "a"
+prompt = "p"
+depends_on = ["b"]
+[[steps]]
+id = "b"
+prompt = "p"
+depends_on = ["a"]
+[output]
+step = "b"
+"#,
+            "circular dependency",
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_provider() {
+        assert_rejects(
+            r#"
+[workflow]
+name = "t"
+[budget]
+max_usd = 1.0
+[[steps]]
+id = "a"
+prompt = "p"
+provider = "gpt-4"
+[output]
+step = "a"
+"#,
+            "unknown provider",
+        );
+    }
+
+    #[test]
+    fn rejects_parallel_over_combined_with_parallel_items() {
+        assert_rejects(
+            r#"
+[workflow]
+name = "t"
+[budget]
+max_usd = 1.0
+[[steps]]
+id = "plan"
+prompt = "p"
+[[steps]]
+id = "fan"
+prompt = "p"
+parallel_over = "plan"
+parallel_items = ["x"]
+depends_on = ["plan"]
+[output]
+step = "fan"
+"#,
+            "cannot set both",
+        );
+    }
+
+    #[test]
+    fn rejects_parallel_over_missing_from_depends_on() {
+        assert_rejects(
+            r#"
+[workflow]
+name = "t"
+[budget]
+max_usd = 1.0
+[[steps]]
+id = "plan"
+prompt = "p"
+[[steps]]
+id = "fan"
+prompt = "p"
+parallel_over = "plan"
+[output]
+step = "fan"
+"#,
+            "not listed in depends_on",
+        );
+    }
+}

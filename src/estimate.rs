@@ -128,3 +128,103 @@ fn estimate_llm_step(step: &Step) -> StepEstimate {
         assumptions,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const EPS: f64 = 1e-9;
+
+    fn step(src: &str) -> Step {
+        toml::from_str(src).expect("test step TOML should parse")
+    }
+
+    #[test]
+    fn static_parallel_items_use_exact_count() {
+        let est = estimate_step(&step(
+            "id = \"fan\"\nprompt = \"p\"\nprovider = \"claude-code\"\n\
+             parallel_items = [\"a\", \"b\", \"c\"]\ncost_per_call_usd = 0.5",
+        ));
+        assert!((est.cost_usd - 1.5).abs() < EPS);
+        // Count is known exactly, cost is explicit: nothing was assumed.
+        assert!(est.assumptions.is_empty());
+    }
+
+    #[test]
+    fn parallel_over_uses_max_items_cap() {
+        let est = estimate_step(&step(
+            "id = \"fan\"\nprompt = \"p\"\nprovider = \"claude-code\"\n\
+             parallel_over = \"plan\"\ndepends_on = [\"plan\"]\n\
+             max_items = 4\ncost_per_call_usd = 0.5",
+        ));
+        assert!((est.cost_usd - 2.0).abs() < EPS);
+        assert!(est.assumptions.iter().any(|a| a.contains("max_items")));
+    }
+
+    #[test]
+    fn unbounded_parallel_over_assumes_default_fan_out() {
+        let est = estimate_step(&step(
+            "id = \"fan\"\nprompt = \"p\"\nprovider = \"claude-code\"\n\
+             parallel_over = \"plan\"\ndepends_on = [\"plan\"]\ncost_per_call_usd = 1.0",
+        ));
+        assert!((est.cost_usd - DEFAULT_FAN_OUT_ITEMS as f64).abs() < EPS);
+        assert!(est.assumptions.iter().any(|a| a.contains("max_items")));
+    }
+
+    #[test]
+    fn missing_agent_cost_falls_back_and_is_flagged() {
+        let est = estimate_step(&step(
+            "id = \"solo\"\nprompt = \"p\"\nprovider = \"claude-code\"",
+        ));
+        assert!((est.cost_usd - DEFAULT_AGENT_COST_PER_CALL_USD).abs() < EPS);
+        assert!(
+            est.assumptions
+                .iter()
+                .any(|a| a.contains("cost_per_call_usd"))
+        );
+    }
+
+    #[test]
+    fn web_search_adds_per_call_surcharge() {
+        let plain = estimate_step(&step("id = \"a\"\nprompt = \"find papers\""));
+        let searching = estimate_step(&step(
+            "id = \"a\"\nprompt = \"find papers\"\ntools = [\"web_search\"]\nmax_tool_calls = 10",
+        ));
+        // 10 searches at $0.01 plus their result tokens — strictly more than
+        // the surcharge alone.
+        assert!(searching.cost_usd - plain.cost_usd > 10.0 * WEB_SEARCH_COST_PER_CALL_USD);
+        assert!(
+            searching
+                .assumptions
+                .iter()
+                .any(|a| a.contains("web searches"))
+        );
+    }
+
+    #[test]
+    fn workflow_total_is_sum_of_steps() {
+        let wf: WorkflowFile = toml::from_str(
+            r#"
+[workflow]
+name = "t"
+[budget]
+max_usd = 1.0
+[[steps]]
+id = "a"
+prompt = "p"
+[[steps]]
+id = "b"
+prompt = "p"
+depends_on = ["a"]
+[output]
+step = "b"
+"#,
+        )
+        .unwrap();
+        let est = estimate_workflow(&wf);
+        assert_eq!(est.steps.len(), 2);
+        let sum: f64 = est.steps.iter().map(|s| s.cost_usd).sum();
+        assert!((est.total_usd - sum).abs() < EPS);
+        assert!(est.total_usd > 0.0);
+    }
+}

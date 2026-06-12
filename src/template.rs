@@ -29,3 +29,48 @@ pub fn render_prompt(
     env.render_str(template, Value::Object(ctx))
         .map_err(|e| crate::FluxError::Template(e.to_string()))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn map(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn inputs_resolve_as_top_level_variables() {
+        let rendered = render_prompt(
+            "Research {{ topic }}",
+            &map(&[("topic", "rust async")]),
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(rendered, "Research rust async");
+    }
+
+    #[test]
+    fn step_outputs_resolve_under_dot_output() {
+        let rendered = render_prompt(
+            "Prior findings: {{ find.output }}",
+            &HashMap::new(),
+            &map(&[("find", "three papers")]),
+        )
+        .unwrap();
+        assert_eq!(rendered, "Prior findings: three papers");
+    }
+
+    #[test]
+    fn undefined_variables_render_empty_in_lenient_mode() {
+        let rendered = render_prompt(
+            "before {{ missing }} after",
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(rendered, "before  after");
+    }
+}
