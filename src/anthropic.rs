@@ -3,8 +3,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use reqwest::StatusCode;
 use serde::Deserialize;
+use serde_json::{Value, json};
 use tokio::time::sleep;
-use tracing::{debug, info, instrument, warn};
+use tracing::{info, instrument, warn};
 
 use crate::{
     FluxError,
@@ -16,6 +17,10 @@ const ANTHROPIC_VERSION: &str = "2023-06-01";
 const DEFAULT_MAX_TOKENS: u32 = 8096;
 const MAX_RETRIES: u32 = 6;
 const MAX_RETRY_DELAY_SECS: u64 = 90;
+// pause_turn means the server-side tool loop hit its iteration limit and
+// wants the conversation re-sent to resume where it left off. Cap how many
+// times we oblige so a pathological step can't loop forever.
+const MAX_CONTINUATIONS: u32 = 3;
 
 pub struct AnthropicClient {
     client: reqwest::Client,
@@ -38,32 +43,13 @@ impl AnthropicClient {
 impl LlmProvider for AnthropicClient {
     #[instrument(skip(self, request), fields(model = %request.model))]
     async fn complete(&self, request: CompletionRequest) -> crate::Result<CompletionResponse> {
-        let max_tokens = if request.max_tokens > 0 {
-            request.max_tokens
-        } else {
-            DEFAULT_MAX_TOKENS
-        };
+        let max_tokens = request.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
 
-        let tools: Vec<serde_json::Value> = request
+        let tools: Vec<Value> = request
             .tools
             .iter()
             .map(|t| make_tool_def(t, request.max_tool_calls))
             .collect();
-
-        let body = if tools.is_empty() {
-            serde_json::json!({
-                "model": request.model,
-                "max_tokens": max_tokens,
-                "messages": [{"role": "user", "content": request.prompt}],
-            })
-        } else {
-            serde_json::json!({
-                "model": request.model,
-                "max_tokens": max_tokens,
-                "messages": [{"role": "user", "content": request.prompt}],
-                "tools": tools,
-            })
-        };
 
         let tool_names = request.tools.join(", ");
         if tool_names.is_empty() {
@@ -71,48 +57,107 @@ impl LlmProvider for AnthropicClient {
         } else {
             info!(model = %request.model, tools = %tool_names, "→ calling API (web search may take 20-40s)");
         }
-        let response = send_with_retries(&self.client, &self.api_key, &body).await?;
 
-        info!(
-            input_tokens = response.usage.input_tokens,
-            output_tokens = response.usage.output_tokens,
-            "← response received"
-        );
-        debug!(
-            input_tokens = response.usage.input_tokens,
-            output_tokens = response.usage.output_tokens,
-            "received response"
-        );
+        // The conversation only grows when the server pauses a tool turn:
+        // we echo the assistant's content back verbatim and re-send, and the
+        // API resumes its server-side tool loop where it stopped.
+        let mut messages = vec![json!({"role": "user", "content": request.prompt})];
+        let mut content = String::new();
+        let mut input_tokens = 0u32;
+        let mut output_tokens = 0u32;
+        let mut web_search_requests = 0u32;
+        let mut continuations = 0u32;
 
-        Ok(CompletionResponse {
-            content: extract_text(&response.content),
-            input_tokens: response.usage.input_tokens,
-            output_tokens: response.usage.output_tokens,
-            web_search_requests: response
+        loop {
+            let mut body = json!({
+                "model": request.model,
+                "max_tokens": max_tokens,
+                "messages": messages.clone(),
+            });
+            if !tools.is_empty() {
+                body["tools"] = Value::Array(tools.clone());
+            }
+
+            let response = send_with_retries(&self.client, &self.api_key, &body).await?;
+
+            // Each continuation round bills its own usage; report the sum.
+            input_tokens += response.usage.input_tokens;
+            output_tokens += response.usage.output_tokens;
+            web_search_requests += response
                 .usage
                 .server_tool_use
-                .map_or(0, |t| t.web_search_requests),
-        })
+                .as_ref()
+                .map_or(0, |t| t.web_search_requests);
+
+            let text = extract_text(&response.content);
+            if !text.is_empty() {
+                if !content.is_empty() {
+                    content.push('\n');
+                }
+                content.push_str(&text);
+            }
+
+            match response.stop_reason.as_deref() {
+                Some("pause_turn") if continuations < MAX_CONTINUATIONS => {
+                    continuations += 1;
+                    info!(
+                        continuation = continuations,
+                        "server paused tool turn; resuming"
+                    );
+                    // Echo the content blocks back untouched — the API detects
+                    // the trailing server tool state and continues on its own.
+                    // No extra user message.
+                    messages.push(json!({"role": "assistant", "content": response.content}));
+                    continue;
+                }
+                Some("pause_turn") => {
+                    warn!("continuation limit reached; returning partial result");
+                    content.push_str(
+                        "\n\n[NOTE: web tool loop cut off after repeated continuations — \
+                         results may be incomplete]",
+                    );
+                }
+                Some("max_tokens") => {
+                    warn!(
+                        max_tokens,
+                        "response truncated; raise max_tokens on this step"
+                    );
+                    content.push_str(
+                        "\n\n[NOTE: output truncated at max_tokens limit — \
+                         raise max_tokens on this step]",
+                    );
+                }
+                _ => {}
+            }
+
+            info!(input_tokens, output_tokens, "← response received");
+            return Ok(CompletionResponse {
+                content,
+                input_tokens,
+                output_tokens,
+                web_search_requests,
+            });
+        }
     }
 }
 
 // Maps the tool names used in workflow TOML to the Anthropic API's server-tool type strings.
 // These are managed server-side by Anthropic — no client-side execution loop needed.
-fn make_tool_def(name: &str, max_uses: u32) -> serde_json::Value {
+fn make_tool_def(name: &str, max_uses: u32) -> Value {
     match name {
-        "web_search" => serde_json::json!({
+        "web_search" => json!({
             "type": "web_search_20260209",
             "name": "web_search",
             "max_uses": max_uses,
             "allowed_callers": ["direct"],
         }),
-        "web_fetch" => serde_json::json!({
+        "web_fetch" => json!({
             "type": "web_fetch_20260209",
             "name": "web_fetch",
             "max_uses": max_uses,
             "allowed_callers": ["direct"],
         }),
-        _ => serde_json::json!({
+        _ => json!({
             "name": name,
             "description": "A custom tool.",
             "input_schema": {"type": "object", "properties": {}},
@@ -123,7 +168,7 @@ fn make_tool_def(name: &str, max_uses: u32) -> serde_json::Value {
 async fn send_with_retries(
     client: &reqwest::Client,
     api_key: &str,
-    body: &serde_json::Value,
+    body: &Value,
 ) -> crate::Result<ApiResponse> {
     let mut attempt = 0u32;
     loop {
@@ -168,34 +213,29 @@ async fn send_with_retries(
     }
 }
 
-fn extract_text(blocks: &[ContentBlock]) -> String {
+// Concatenates the text blocks from a raw content array. Non-text blocks
+// (server_tool_use, web_search_tool_result, ...) are skipped.
+fn extract_text(content: &Value) -> String {
+    let Some(blocks) = content.as_array() else {
+        return String::new();
+    };
     blocks
         .iter()
-        .filter_map(|b| {
-            if b.kind == "text" {
-                b.text.as_deref()
-            } else {
-                None
-            }
-        })
+        .filter(|b| b["type"] == "text")
+        .filter_map(|b| b["text"].as_str())
         .collect::<Vec<_>>()
         .join("\n")
 }
 
 #[derive(Deserialize)]
 struct ApiResponse {
-    content: Vec<ContentBlock>,
+    // Raw JSON rather than typed structs: a pause_turn continuation must echo
+    // the content back byte-faithfully, including block types we don't model
+    // (server_tool_use, web_search_tool_result, ...). Same typed-vs-dynamic
+    // tradeoff as parse_agent_output in agent.rs.
+    content: Value,
     usage: Usage,
-}
-
-// Flat struct rather than enum: content blocks have a `type` field plus optional
-// type-specific fields. Using a struct with Option<String> for `text` handles
-// both text blocks and server_tool_use blocks without needing to enumerate every type.
-#[derive(Deserialize)]
-struct ContentBlock {
-    #[serde(rename = "type")]
-    kind: String,
-    text: Option<String>,
+    stop_reason: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -214,4 +254,26 @@ struct ServerToolUse {
     // default covers responses where only web_fetch ran and this key is absent.
     #[serde(default)]
     web_search_requests: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_text_concatenates_text_blocks_only() {
+        let content = json!([
+            {"type": "text", "text": "first"},
+            {"type": "server_tool_use", "id": "x", "name": "web_search", "input": {}},
+            {"type": "web_search_tool_result", "tool_use_id": "x", "content": []},
+            {"type": "text", "text": "second"},
+        ]);
+        assert_eq!(extract_text(&content), "first\nsecond");
+    }
+
+    #[test]
+    fn extract_text_tolerates_unexpected_shapes() {
+        assert_eq!(extract_text(&json!(null)), "");
+        assert_eq!(extract_text(&json!([{"type": "text"}])), "");
+    }
 }

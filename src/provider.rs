@@ -14,7 +14,9 @@ pub struct CompletionRequest {
     pub prompt: String,
     pub tools: Vec<String>,
     pub max_tool_calls: u32,
-    pub max_tokens: u32,
+    /// None means the provider's default. Option instead of a 0-sentinel:
+    /// the type says "maybe absent" so callers can't confuse absent with zero.
+    pub max_tokens: Option<u32>,
 }
 
 pub struct CompletionResponse {

@@ -44,6 +44,10 @@ pub struct Step {
     #[serde(default)]
     pub tools: Vec<String>,
     pub max_tool_calls: Option<u32>,
+    /// Output token budget for this step's API calls (default 8096).
+    /// Raise on synthesis steps that write long reports — a step that hits
+    /// the cap is truncated (flagged with a [NOTE: ...] marker in its output).
+    pub max_tokens: Option<u32>,
     pub parallel_over: Option<String>,
     /// Static list of items to fan out over. Alternative to parallel_over when
     /// the items are known at workflow-authoring time and don't need a model step
@@ -64,7 +68,7 @@ pub struct Step {
     pub appends_to: Option<String>,
     /// Seconds before an agent call is killed and reported as failed.
     /// Only applies to agent provider steps (claude-code, hermes).
-    /// Defaults to 60 if not set.
+    /// Defaults to 300 if not set.
     pub timeout_secs: Option<u64>,
 }
 

@@ -200,7 +200,7 @@ impl Engine {
                 prompt: prompt.clone(),
                 tools: step.tools.clone(),
                 max_tool_calls: step.max_tool_calls.unwrap_or(5),
-                max_tokens: 0,
+                max_tokens: step.max_tokens,
             })
             .await?;
 
@@ -529,6 +529,8 @@ impl Engine {
         let llm = Arc::clone(&self.llm);
         let step_id = step.id.clone();
         let max_tool_calls = step.max_tool_calls.unwrap_or(5);
+        // Option<u32> is Copy, so each async move block gets its own copy.
+        let max_tokens = step.max_tokens;
 
         let futures: Vec<_> = item_prompts
             .into_iter()
@@ -549,7 +551,7 @@ impl Engine {
                             prompt,
                             tools,
                             max_tool_calls,
-                            max_tokens: 0,
+                            max_tokens,
                         })
                         .await;
                     (item, result)
