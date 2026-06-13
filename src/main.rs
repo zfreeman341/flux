@@ -39,6 +39,10 @@ async fn run(args: flux::cli::RunArgs) -> Result<()> {
     flux::validator::validate_workflow(&wf).context("workflow validation failed")?;
 
     let inputs = build_inputs(&args)?;
+    // Fail on missing inputs before any client exists: no API key needed,
+    // nothing spent. Lenient templates would otherwise render them empty
+    // and burn the budget on a garbage prompt.
+    flux::validator::check_required_inputs(&wf, &inputs)?;
 
     let client =
         flux::anthropic::AnthropicClient::from_env().context("failed to init Anthropic client")?;

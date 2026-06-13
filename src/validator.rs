@@ -9,7 +9,46 @@ pub fn validate_workflow(wf: &WorkflowFile) -> crate::Result<()> {
     check_no_cycles(wf)?;
     check_providers(wf)?;
     check_parallel_over(wf)?;
+    check_output_step(wf)?;
     Ok(())
+}
+
+// The output step is only consulted after every step has run — without this
+// check, a typo here is discovered after the entire budget is spent.
+fn check_output_step(wf: &WorkflowFile) -> crate::Result<()> {
+    if !wf.steps.iter().any(|s| s.id == wf.output.step) {
+        return Err(FluxError::Config(format!(
+            "output step '{}' does not match any step id",
+            wf.output.step
+        )));
+    }
+    Ok(())
+}
+
+/// Checks that every input declared in `[inputs]` was actually provided on
+/// the command line. Called by `flux run` before any API client is built:
+/// a missing input would otherwise render as an empty template variable
+/// (lenient mode) and silently burn the whole budget on a garbage prompt.
+pub fn check_required_inputs(
+    wf: &WorkflowFile,
+    provided: &HashMap<String, String>,
+) -> crate::Result<()> {
+    let mut missing: Vec<String> = wf
+        .inputs
+        .iter()
+        .filter(|(name, _)| !provided.contains_key(*name))
+        .map(|(name, def)| format!("  --input {name}=...  ({})", def.description))
+        .collect();
+    // HashMap iteration order is nondeterministic; sort for a stable message.
+    missing.sort();
+
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(FluxError::Config(format!(
+        "missing required input(s):\n{}",
+        missing.join("\n")
+    )))
 }
 
 fn check_budget(wf: &WorkflowFile) -> crate::Result<()> {
@@ -296,6 +335,77 @@ depends_on = ["plan"]
 step = "fan"
 "#,
             "cannot set both",
+        );
+    }
+
+    #[test]
+    fn rejects_output_step_that_does_not_exist() {
+        assert_rejects(
+            r#"
+[workflow]
+name = "t"
+[budget]
+max_usd = 1.0
+[[steps]]
+id = "a"
+prompt = "p"
+[output]
+step = "synthesisze"
+"#,
+            "does not match any step id",
+        );
+    }
+
+    #[test]
+    fn required_inputs_pass_when_provided() {
+        let wf = wf(r#"
+[workflow]
+name = "t"
+[budget]
+max_usd = 1.0
+[inputs]
+topic = { description = "what to research" }
+[[steps]]
+id = "a"
+prompt = "p"
+[output]
+step = "a"
+"#);
+        let provided = HashMap::from([("topic".to_string(), "rust".to_string())]);
+        assert!(check_required_inputs(&wf, &provided).is_ok());
+    }
+
+    #[test]
+    fn required_inputs_fail_listing_missing_keys() {
+        let wf = wf(r#"
+[workflow]
+name = "t"
+[budget]
+max_usd = 1.0
+[inputs]
+topic = { description = "what to research" }
+region = { description = "where" }
+[[steps]]
+id = "a"
+prompt = "p"
+[output]
+step = "a"
+"#);
+        let provided = HashMap::from([("topic".to_string(), "rust".to_string())]);
+        let msg = check_required_inputs(&wf, &provided)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.contains("region"),
+            "should name the missing input: {msg}"
+        );
+        assert!(
+            msg.contains("where"),
+            "should include the description: {msg}"
+        );
+        assert!(
+            !msg.contains("topic ="),
+            "provided input should not be listed: {msg}"
         );
     }
 
