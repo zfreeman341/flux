@@ -16,11 +16,11 @@ use crate::{
 };
 
 pub struct Engine {
-    llm: Box<dyn LlmProvider>,
-    // Arc (atomic reference count) instead of Box because we clone this handle
+    // Arc (atomic reference count) instead of Box because we clone these handles
     // for each concurrent task in a parallel fan-out. Box gives unique ownership
     // (one owner); Arc gives shared ownership (many owners, freed when all drop).
-    // The type must be Send + Sync because it crosses task/thread boundaries.
+    // The types must be Send + Sync because they cross task/thread boundaries.
+    llm: Arc<dyn LlmProvider>,
     agent: Arc<dyn AgentProvider>,
 }
 
@@ -43,7 +43,7 @@ pub struct StepResult {
 }
 
 impl Engine {
-    pub fn new(llm: Box<dyn LlmProvider>, agent: Arc<dyn AgentProvider>) -> Self {
+    pub fn new(llm: Arc<dyn LlmProvider>, agent: Arc<dyn AgentProvider>) -> Self {
         Self { llm, agent }
     }
 
@@ -342,15 +342,10 @@ impl Engine {
             items.truncate(cap);
         }
 
-        let n = items.len();
-        let cost = cost::resolve_cost(step, n);
-        budget.add(cost)?;
-
-        info!(step = %step.id, items = n, "starting parallel fan-out");
-
         // Build (item, rendered_prompt) pairs synchronously before entering any
-        // async block. This lets render_prompt borrow step_outputs safely without
-        // needing to clone the whole map into every future.
+        // async block — and before any budget charge, so a template error can't
+        // leave a phantom pre-charge behind. render_prompt borrows step_outputs
+        // safely without cloning the whole map into every future.
         let item_prompts: Vec<(String, String)> = items
             .iter()
             .map(|item| {
@@ -363,6 +358,37 @@ impl Engine {
                 Ok((item.clone(), prompt))
             })
             .collect::<crate::Result<_>>()?;
+
+        info!(step = %step.id, items = item_prompts.len(), "starting parallel fan-out");
+
+        // Dispatch on provider: agent CLIs fan out as subprocesses; everything
+        // else fans out as direct API calls, honoring the step's model and tools.
+        match step.provider.as_deref() {
+            Some("hermes") | Some("claude-code") => {
+                self.run_parallel_agent(step, item_prompts, budget, step_start)
+                    .await
+            }
+            _ => {
+                self.run_parallel_llm(step, item_prompts, budget, step_start)
+                    .await
+            }
+        }
+    }
+
+    // Agent fan-out: one subprocess per item. Cost is pre-charged from
+    // cost_per_call_usd before any agent fires — agents don't report usage
+    // up front, and an N-item fan-out must not over-commit the budget.
+    // Failed calls are refunded after the fact.
+    async fn run_parallel_agent(
+        &self,
+        step: &Step,
+        item_prompts: Vec<(String, String)>,
+        budget: &mut BudgetTracker,
+        step_start: Instant,
+    ) -> crate::Result<StepResult> {
+        let n = item_prompts.len();
+        let cost = cost::resolve_cost(step, n);
+        budget.add(cost)?;
 
         // Semaphore limits how many agent processes can be in-flight at once.
         // Arc because each async block in the map below takes ownership of a clone.
@@ -461,6 +487,117 @@ impl Engine {
             input_tokens: 0,
             output_tokens: 0,
             cost_usd: cost,
+            duration,
+        })
+    }
+
+    // API fan-out: one direct Anthropic call per item, honoring the step's
+    // model and tools. Roughly an order of magnitude cheaper per item than an
+    // agent subprocess for search-and-summarize work, and rate limits are
+    // handled by the client's own 429 backoff.
+    //
+    // Budgeting differs from the agent path: there is no pre-charge, because
+    // actual token costs are only known after each call returns, and updating
+    // the budget from inside concurrent futures would need a Mutex. Instead
+    // the summed actual cost is charged once after join_all. The overshoot
+    // window is bounded by (items × per-item cost) — small for API calls,
+    // which is exactly why the agent path keeps its pre-charge and this one
+    // doesn't.
+    async fn run_parallel_llm(
+        &self,
+        step: &Step,
+        item_prompts: Vec<(String, String)>,
+        budget: &mut BudgetTracker,
+        step_start: Instant,
+    ) -> crate::Result<StepResult> {
+        let semaphore = Arc::new(Semaphore::new(step.max_concurrent.unwrap_or(3)));
+        let llm = Arc::clone(&self.llm);
+        let step_id = step.id.clone();
+        let max_tool_calls = step.max_tool_calls.unwrap_or(5);
+
+        let futures: Vec<_> = item_prompts
+            .into_iter()
+            .map(|(item, prompt)| {
+                let sem = Arc::clone(&semaphore);
+                let llm = Arc::clone(&llm);
+                let step_id = step_id.clone();
+                // Clone per future: each async move block takes ownership of
+                // its own copies, so nothing borrows `step` across an await.
+                let model = step.model.clone();
+                let tools = step.tools.clone();
+                async move {
+                    let _permit = sem.acquire().await.unwrap();
+                    info!(step = %step_id, item = %item, "api call start");
+                    let result = llm
+                        .complete(CompletionRequest {
+                            model,
+                            prompt,
+                            tools,
+                            max_tool_calls,
+                            max_tokens: 0,
+                        })
+                        .await;
+                    (item, result)
+                }
+            })
+            .collect();
+
+        let results = join_all(futures).await;
+
+        let mut output_parts: Vec<String> = Vec::new();
+        let mut input_tokens = 0u32;
+        let mut output_tokens = 0u32;
+        let mut total_cost = 0.0f64;
+        for (item, result) in results {
+            match result {
+                Ok(resp) => {
+                    total_cost += cost::call_cost_usd(
+                        &step.model,
+                        resp.input_tokens,
+                        resp.output_tokens,
+                        resp.web_search_requests,
+                    );
+                    input_tokens += resp.input_tokens;
+                    output_tokens += resp.output_tokens;
+                    output_parts.push(format!("--- {} ---\n{}", item, resp.content));
+                }
+                Err(e) => {
+                    warn!(step = %step.id, item = %item, error = %e, "api call failed, skipping");
+                    output_parts.push(format!("--- {} ---\n[FAILED: {}]", item, e));
+                }
+            }
+        }
+
+        // Charge actual spend. If this trips the budget the money is already
+        // spent and the outputs exist — keep them, record the spend, and let
+        // the next step's charge trigger the graceful-skip path.
+        if let Err(e) = budget.add(total_cost) {
+            warn!(
+                step = %step.id,
+                error = %e,
+                "parallel api step exceeded budget; downstream steps will be skipped"
+            );
+        }
+
+        let combined = output_parts.join("\n\n");
+        let duration = step_start.elapsed();
+        info!(
+            step = %step.id,
+            input_tokens,
+            output_tokens,
+            cost_usd = format!("{:.4}", total_cost),
+            duration_secs = format!("{:.1}", duration.as_secs_f64()),
+            "parallel api fan-out complete"
+        );
+
+        Ok(StepResult {
+            id: step.id.clone(),
+            model: step.model.clone(),
+            prompt: step.prompt.clone(),
+            output: combined,
+            input_tokens,
+            output_tokens,
+            cost_usd: total_cost,
             duration,
         })
     }
@@ -684,5 +821,121 @@ mod tests {
         assert_eq!(strip_list_marker("1.Acme"), "1.Acme");
         // Non-numeric prefix before ". " is content, not a marker.
         assert_eq!(strip_list_marker("Inc. Acme"), "Inc. Acme");
+    }
+
+    // --- end-to-end engine tests with mock providers ---
+    //
+    // Implementing the provider traits on test doubles is the payoff of the
+    // trait-object design: the whole engine runs against canned responses
+    // with no network, no API key, and no money.
+
+    use crate::provider::{AgentResponse, CompletionResponse};
+    use async_trait::async_trait;
+
+    struct MockLlm;
+
+    #[async_trait]
+    impl LlmProvider for MockLlm {
+        async fn complete(&self, request: CompletionRequest) -> crate::Result<CompletionResponse> {
+            // A planner prompt yields two fan-out items; anything else echoes
+            // its prompt so tests can see exactly which call produced what.
+            let content = if request.prompt.contains("PLAN") {
+                "alpha\nbeta".to_string()
+            } else {
+                format!("researched[{}]", request.prompt)
+            };
+            Ok(CompletionResponse {
+                content,
+                input_tokens: 100,
+                output_tokens: 50,
+                web_search_requests: 0,
+            })
+        }
+    }
+
+    struct MockAgent;
+
+    #[async_trait]
+    impl AgentProvider for MockAgent {
+        async fn run(&self, request: AgentRequest) -> crate::Result<AgentResponse> {
+            Ok(AgentResponse {
+                output: format!("agent[{}]", request.task),
+                duration: Duration::from_millis(1),
+            })
+        }
+    }
+
+    fn workflow(fan_step_extra: &str) -> WorkflowFile {
+        toml::from_str(&format!(
+            r#"
+[workflow]
+name = "t"
+[budget]
+max_usd = 5.0
+[[steps]]
+id = "plan"
+prompt = "PLAN"
+[[steps]]
+id = "fan"
+prompt = "look into {{{{ item }}}}"
+parallel_over = "plan"
+depends_on = ["plan"]
+{fan_step_extra}
+[[steps]]
+id = "synth"
+prompt = "combine {{{{ fan.output }}}}"
+depends_on = ["fan"]
+[output]
+step = "synth"
+"#
+        ))
+        .expect("test workflow TOML should parse")
+    }
+
+    #[tokio::test]
+    async fn parallel_fan_out_without_provider_uses_the_api() {
+        let wf = workflow("");
+        let engine = Engine::new(Arc::new(MockLlm), Arc::new(MockAgent));
+        let mut budget = BudgetTracker::new(5.0);
+
+        let result = engine
+            .run(&wf, &HashMap::new(), &mut budget)
+            .await
+            .expect("workflow should succeed");
+
+        let fan = result.step_results.iter().find(|s| s.id == "fan").unwrap();
+        assert!(fan.output.contains("--- alpha ---"), "{}", fan.output);
+        assert!(fan.output.contains("--- beta ---"), "{}", fan.output);
+        assert!(
+            fan.output.contains("researched[look into alpha]"),
+            "fan-out should hit the API mock, not the agent: {}",
+            fan.output
+        );
+        // Two items × the mock's 100/50 tokens, actually charged to the budget.
+        assert_eq!(fan.input_tokens, 200);
+        assert_eq!(fan.output_tokens, 100);
+        assert!(fan.cost_usd > 0.0);
+        assert!(budget.spent_usd >= fan.cost_usd);
+    }
+
+    #[tokio::test]
+    async fn parallel_fan_out_with_agent_provider_uses_the_agent() {
+        let wf = workflow("provider = \"claude-code\"\ncost_per_call_usd = 0.1");
+        let engine = Engine::new(Arc::new(MockLlm), Arc::new(MockAgent));
+        let mut budget = BudgetTracker::new(5.0);
+
+        let result = engine
+            .run(&wf, &HashMap::new(), &mut budget)
+            .await
+            .expect("workflow should succeed");
+
+        let fan = result.step_results.iter().find(|s| s.id == "fan").unwrap();
+        assert!(
+            fan.output.contains("agent[look into alpha]"),
+            "agent provider should route to the agent mock: {}",
+            fan.output
+        );
+        // Two items pre-charged at the declared cost_per_call_usd.
+        assert!((fan.cost_usd - 0.2).abs() < 1e-9);
     }
 }

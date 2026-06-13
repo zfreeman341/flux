@@ -43,27 +43,28 @@ pub fn estimate_workflow(wf: &WorkflowFile) -> WorkflowEstimate {
 }
 
 fn estimate_step(step: &Step) -> StepEstimate {
-    // Mirrors the engine's dispatch: any parallel step runs through the agent
-    // provider, as does a non-parallel step with an agent provider name.
+    // Mirrors the engine's dispatch: agent providers fan out as subprocesses
+    // priced per call; everything else is direct API calls priced by tokens —
+    // including parallel steps, which fan out one API call per item.
     let is_parallel = step.parallel_over.is_some() || !step.parallel_items.is_empty();
     let is_agent = matches!(
         step.provider.as_deref(),
         Some("hermes") | Some("claude-code")
     );
 
-    if is_parallel || is_agent {
+    if is_agent {
         estimate_agent_step(step, is_parallel)
+    } else if is_parallel {
+        estimate_parallel_llm_step(step)
     } else {
         estimate_llm_step(step)
     }
 }
 
-fn estimate_agent_step(step: &Step, is_parallel: bool) -> StepEstimate {
-    let mut assumptions = Vec::new();
-
-    let count = if !is_parallel {
-        1
-    } else if !step.parallel_items.is_empty() {
+// Resolves how many items a parallel step will fan out over, recording an
+// assumption whenever the answer is a guess rather than a known count.
+fn resolve_fan_out_count(step: &Step, assumptions: &mut Vec<String>) -> usize {
+    if !step.parallel_items.is_empty() {
         step.parallel_items.len()
     } else if let Some(cap) = step.max_items {
         assumptions.push(format!("fan-out at the max_items cap of {cap}"));
@@ -73,6 +74,32 @@ fn estimate_agent_step(step: &Step, is_parallel: bool) -> StepEstimate {
             "fan-out of {DEFAULT_FAN_OUT_ITEMS} items (set max_items to bound this)"
         ));
         DEFAULT_FAN_OUT_ITEMS
+    }
+}
+
+fn estimate_parallel_llm_step(step: &Step) -> StepEstimate {
+    let mut assumptions = Vec::new();
+    let count = resolve_fan_out_count(step, &mut assumptions);
+    // Each item is an independent API call with the same prompt shape;
+    // estimate one and multiply.
+    let per_item = estimate_llm_step(step);
+    assumptions.push(format!("~${:.2} per item × {count}", per_item.cost_usd));
+    assumptions.extend(per_item.assumptions);
+
+    StepEstimate {
+        id: step.id.clone(),
+        cost_usd: per_item.cost_usd * count as f64,
+        assumptions,
+    }
+}
+
+fn estimate_agent_step(step: &Step, is_parallel: bool) -> StepEstimate {
+    let mut assumptions = Vec::new();
+
+    let count = if is_parallel {
+        resolve_fan_out_count(step, &mut assumptions)
+    } else {
+        1
     };
 
     let per_call = match step.cost_per_call_usd {
@@ -182,6 +209,25 @@ mod tests {
                 .iter()
                 .any(|a| a.contains("cost_per_call_usd"))
         );
+    }
+
+    #[test]
+    fn parallel_step_without_agent_provider_estimates_as_api_fan_out() {
+        // No provider: this now fans out as direct API calls, so the estimate
+        // is per-item token cost × count, not cost_per_call_usd × count.
+        let parallel = step(
+            "id = \"fan\"\nprompt = \"research {{ item }}\"\n\
+             parallel_over = \"plan\"\ndepends_on = [\"plan\"]\nmax_items = 4\n\
+             tools = [\"web_search\"]\nmax_tool_calls = 3",
+        );
+        let single = step(
+            "id = \"one\"\nprompt = \"research {{ item }}\"\ndepends_on = [\"plan\"]\n\
+             tools = [\"web_search\"]\nmax_tool_calls = 3",
+        );
+        let est = estimate_step(&parallel);
+        let per_item = estimate_step(&single);
+        assert!((est.cost_usd - 4.0 * per_item.cost_usd).abs() < EPS);
+        assert!(est.assumptions.iter().any(|a| a.contains("per item")));
     }
 
     #[test]

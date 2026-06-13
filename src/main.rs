@@ -48,7 +48,7 @@ async fn run(args: flux::cli::RunArgs) -> Result<()> {
         flux::anthropic::AnthropicClient::from_env().context("failed to init Anthropic client")?;
     // Default agent provider is claude-code; switch to hermes if you have it installed.
     let agent = Arc::new(flux::agent::CliAgentProvider::claude_code());
-    let engine = flux::engine::Engine::new(Box::new(client), agent);
+    let engine = flux::engine::Engine::new(Arc::new(client), agent);
     let mut budget = flux::cost::BudgetTracker::new(wf.budget.max_usd);
 
     let result = engine
