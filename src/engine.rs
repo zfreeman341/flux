@@ -226,7 +226,7 @@ impl Engine {
             id: step.id.clone(),
             model: step.model.clone(),
             prompt,
-            output: response.content,
+            output: append_sources(response.content, &response.sources),
             input_tokens: response.input_tokens,
             output_tokens: response.output_tokens,
             cost_usd: cost,
@@ -576,7 +576,11 @@ impl Engine {
                     );
                     input_tokens += resp.input_tokens;
                     output_tokens += resp.output_tokens;
-                    output_parts.push(format!("--- {} ---\n{}", item, resp.content));
+                    output_parts.push(format!(
+                        "--- {} ---\n{}",
+                        item,
+                        append_sources(resp.content, &resp.sources)
+                    ));
                 }
                 Err(e) => {
                     warn!(step = %step.id, item = %item, error = %e, "api call failed, skipping");
@@ -618,6 +622,23 @@ impl Engine {
             duration,
         })
     }
+}
+
+// Appends a Sources section to a step's output so cited URLs flow into
+// downstream prompts, the final result, and run artifacts. Verifiability is
+// the point of capturing citations — keep them attached to the text they
+// support.
+fn append_sources(mut output: String, sources: &[String]) -> String {
+    if sources.is_empty() {
+        return output;
+    }
+    output.push_str("\n\nSources:\n");
+    for source in sources {
+        output.push_str("- ");
+        output.push_str(source);
+        output.push('\n');
+    }
+    output
 }
 
 // Adjusts the budget after actual costs come in, replacing what was
@@ -875,13 +896,17 @@ mod tests {
         async fn complete(&self, request: CompletionRequest) -> crate::Result<CompletionResponse> {
             // A planner prompt yields two fan-out items; anything else echoes
             // its prompt so tests can see exactly which call produced what.
-            let content = if request.prompt.contains("PLAN") {
-                "alpha\nbeta".to_string()
+            let (content, sources) = if request.prompt.contains("PLAN") {
+                ("alpha\nbeta".to_string(), vec![])
             } else {
-                format!("researched[{}]", request.prompt)
+                (
+                    format!("researched[{}]", request.prompt),
+                    vec!["Mock Source — https://example.com/mock".to_string()],
+                )
             };
             Ok(CompletionResponse {
                 content,
+                sources,
                 input_tokens: 100,
                 output_tokens: 50,
                 web_search_requests: 0,
@@ -954,6 +979,13 @@ step = "synth"
         assert_eq!(fan.output_tokens, 100);
         assert!(fan.cost_usd > 0.0);
         assert!(budget.spent_usd >= fan.cost_usd);
+        // Cited sources are appended per item so they flow downstream.
+        assert!(
+            fan.output
+                .contains("Sources:\n- Mock Source — https://example.com/mock"),
+            "{}",
+            fan.output
+        );
     }
 
     #[tokio::test]

@@ -21,6 +21,9 @@ pub struct CompletionRequest {
 
 pub struct CompletionResponse {
     pub content: String,
+    /// Cited sources ("Title — URL") from web_search results, deduplicated.
+    /// Empty when the step used no web tools or cited nothing.
+    pub sources: Vec<String>,
     pub input_tokens: u32,
     pub output_tokens: u32,
     /// Web searches the server executed during this request. Billed per call

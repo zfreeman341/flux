@@ -118,6 +118,7 @@ namespaced (`{{ find.output }}`).
 | `depends_on` | Steps that must finish first; their outputs become template variables. |
 | `tools` | Managed server tools: `web_search`, `web_fetch`. |
 | `max_tool_calls` | Cap on tool invocations per step (default 5). |
+| `max_tokens` | Output token budget per call (default 8096). Raise for long synthesis steps — hitting the cap is flagged with a visible `[NOTE: ...]` marker. |
 | `provider` | `anthropic` (default, direct API) or an agent CLI: `claude-code`, `hermes`. |
 | `parallel_over` | Fan out one call per line of the named upstream step's output. |
 | `parallel_items` | Static fan-out list, when the items are known at authoring time. |
@@ -185,10 +186,13 @@ retries is skipped; the synthesizer is told which items failed and writes
 around the gap. Rate limits (429) get exponential backoff that honors the
 server's `retry-after`.
 
-**Everything is observable.** Structured `tracing` logs per step (tokens,
-cost, duration), and every run writes `.flux-runs/<timestamp>/` with each
-step's exact prompt, output, and a cost summary table — which is what makes
-prompt iteration tractable.
+**Everything is observable — and verifiable.** Structured `tracing` logs per
+step (tokens, cost, duration), and every run writes `.flux-runs/<timestamp>/`
+with each step's exact prompt, output, and a cost summary table — which is
+what makes prompt iteration tractable. Web-search citations are captured as a
+per-step `Sources:` section, so claims in the final output trace back to real
+URLs. Anomalous stop reasons are surfaced, not swallowed: output truncation
+gets a visible marker, and paused server tool turns are automatically resumed.
 
 **State lives in files, not a database.** Workflows are version-controlled
 TOML. Run state is ephemeral markdown per run. Long-lived context (notes

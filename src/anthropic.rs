@@ -63,6 +63,7 @@ impl LlmProvider for AnthropicClient {
         // API resumes its server-side tool loop where it stopped.
         let mut messages = vec![json!({"role": "user", "content": request.prompt})];
         let mut content = String::new();
+        let mut sources: Vec<String> = Vec::new();
         let mut input_tokens = 0u32;
         let mut output_tokens = 0u32;
         let mut web_search_requests = 0u32;
@@ -95,6 +96,14 @@ impl LlmProvider for AnthropicClient {
                     content.push('\n');
                 }
                 content.push_str(&text);
+            }
+
+            // Dedupe across continuation rounds too; linear scan is fine for
+            // the handful of sources a step cites.
+            for source in extract_sources(&response.content) {
+                if !sources.contains(&source) {
+                    sources.push(source);
+                }
             }
 
             match response.stop_reason.as_deref() {
@@ -133,6 +142,7 @@ impl LlmProvider for AnthropicClient {
             info!(input_tokens, output_tokens, "← response received");
             return Ok(CompletionResponse {
                 content,
+                sources,
                 input_tokens,
                 output_tokens,
                 web_search_requests,
@@ -213,6 +223,33 @@ async fn send_with_retries(
     }
 }
 
+// Collects cited sources from web_search citations attached to text blocks,
+// formatted "Title — URL" and deduplicated by URL in first-seen order.
+// Citation fields don't count toward token usage, so keeping them is free.
+fn extract_sources(content: &Value) -> Vec<String> {
+    let Some(blocks) = content.as_array() else {
+        return Vec::new();
+    };
+    let mut seen = std::collections::HashSet::new();
+    let mut sources = Vec::new();
+    for block in blocks.iter().filter(|b| b["type"] == "text") {
+        let Some(citations) = block["citations"].as_array() else {
+            continue;
+        };
+        for citation in citations {
+            let Some(url) = citation["url"].as_str() else {
+                continue;
+            };
+            if !seen.insert(url.to_string()) {
+                continue;
+            }
+            let title = citation["title"].as_str().unwrap_or(url);
+            sources.push(format!("{title} — {url}"));
+        }
+    }
+    sources
+}
+
 // Concatenates the text blocks from a raw content array. Non-text blocks
 // (server_tool_use, web_search_tool_result, ...) are skipped.
 fn extract_text(content: &Value) -> String {
@@ -275,5 +312,37 @@ mod tests {
     fn extract_text_tolerates_unexpected_shapes() {
         assert_eq!(extract_text(&json!(null)), "");
         assert_eq!(extract_text(&json!([{"type": "text"}])), "");
+    }
+
+    #[test]
+    fn extract_sources_collects_and_dedupes_citations() {
+        let content = json!([
+            {"type": "text", "text": "a", "citations": [
+                {"type": "web_search_result_location", "url": "https://x.com/1", "title": "One"},
+                {"type": "web_search_result_location", "url": "https://x.com/2", "title": "Two"},
+            ]},
+            {"type": "server_tool_use", "id": "t", "name": "web_search", "input": {}},
+            {"type": "text", "text": "b", "citations": [
+                // Duplicate URL: must not repeat.
+                {"type": "web_search_result_location", "url": "https://x.com/1", "title": "One"},
+            ]},
+            // Text block without citations: fine.
+            {"type": "text", "text": "c"},
+        ]);
+        assert_eq!(
+            extract_sources(&content),
+            vec!["One — https://x.com/1", "Two — https://x.com/2"]
+        );
+    }
+
+    #[test]
+    fn extract_sources_falls_back_to_url_when_title_missing() {
+        let content = json!([
+            {"type": "text", "text": "a", "citations": [{"url": "https://x.com/only"}]},
+        ]);
+        assert_eq!(
+            extract_sources(&content),
+            vec!["https://x.com/only — https://x.com/only"]
+        );
     }
 }
