@@ -246,8 +246,8 @@ impl Engine {
         let provider_name = step.provider.as_deref().unwrap_or("agent");
         info!(step = %step.id, provider = %provider_name, "executing agent step");
 
-        let cost = cost::resolve_cost(step, 1);
-        budget.add(cost)?;
+        let estimated = cost::resolve_cost(step, 1);
+        budget.add(estimated)?;
 
         let prompt = crate::template::render_prompt(&step.prompt, inputs, step_outputs)?;
         let response = self
@@ -258,10 +258,15 @@ impl Engine {
             })
             .await?;
 
+        // Prefer the agent's reported spend over the pre-charged estimate.
+        let cost = response.cost_usd.unwrap_or(estimated);
+        reconcile_budget(budget, &step.id, cost - estimated);
+
         let duration = step_start.elapsed();
         info!(
             step = %step.id,
             cost_usd = format!("{:.4}", cost),
+            actual = response.cost_usd.is_some(),
             duration_secs = format!("{:.1}", duration.as_secs_f64()),
             "agent step complete"
         );
@@ -387,8 +392,10 @@ impl Engine {
         step_start: Instant,
     ) -> crate::Result<StepResult> {
         let n = item_prompts.len();
-        let cost = cost::resolve_cost(step, n);
-        budget.add(cost)?;
+        // Resolve the per-call estimate once: it's both the pre-charge unit
+        // and the fallback for agents that don't report actual cost.
+        let per_call = cost::resolve_cost(step, 1);
+        budget.add(per_call * n as f64)?;
 
         // Semaphore limits how many agent processes can be in-flight at once.
         // Arc because each async block in the map below takes ownership of a clone.
@@ -438,7 +445,7 @@ impl Engine {
         // API spend — don't report it as money spent.
         let failed_count = results.iter().filter(|(_, r)| r.is_err()).count();
         if failed_count > 0 {
-            let refund = cost::resolve_cost(step, failed_count);
+            let refund = per_call * failed_count as f64;
             budget.refund(refund);
             warn!(
                 step = %step.id,
@@ -449,12 +456,15 @@ impl Engine {
         }
 
         let mut output_parts: Vec<String> = Vec::new();
+        let mut actual_cost = 0.0f64;
         for (item, result) in results {
             match result {
                 Ok(resp) => {
+                    actual_cost += resp.cost_usd.unwrap_or(per_call);
                     info!(
                         step = %step.id,
                         item = %item,
+                        cost_usd = ?resp.cost_usd,
                         duration_secs = format!("{:.1}", resp.duration.as_secs_f64()),
                         "agent call complete"
                     );
@@ -467,6 +477,11 @@ impl Engine {
             }
         }
 
+        // Replace the estimated charge for the calls that ran with what the
+        // agents actually reported spending.
+        let charged = per_call * (n - failed_count) as f64;
+        reconcile_budget(budget, &step.id, actual_cost - charged);
+
         let combined = output_parts.join("\n\n");
         let duration = step_start.elapsed();
         let provider_name = step.provider.as_deref().unwrap_or("agent");
@@ -474,7 +489,7 @@ impl Engine {
         info!(
             step = %step.id,
             items = n,
-            cost_usd = format!("{:.4}", cost),
+            cost_usd = format!("{:.4}", actual_cost),
             duration_secs = format!("{:.1}", duration.as_secs_f64()),
             "parallel fan-out complete"
         );
@@ -486,7 +501,7 @@ impl Engine {
             output: combined,
             input_tokens: 0,
             output_tokens: 0,
-            cost_usd: cost,
+            cost_usd: actual_cost,
             duration,
         })
     }
@@ -600,6 +615,25 @@ impl Engine {
             cost_usd: total_cost,
             duration,
         })
+    }
+}
+
+// Adjusts the budget after actual costs come in, replacing what was
+// pre-charged from estimates. A positive delta can trip the limit — but at
+// that point the money is already spent, so record it with a warning and let
+// the next step's charge trigger the graceful-skip path, rather than
+// discarding work that already happened (and was already paid for).
+fn reconcile_budget(budget: &mut BudgetTracker, step_id: &str, delta: f64) {
+    if delta > 0.0 {
+        if let Err(e) = budget.add(delta) {
+            warn!(
+                step = %step_id,
+                error = %e,
+                "actual agent cost exceeded budget; downstream steps will be skipped"
+            );
+        }
+    } else if delta < 0.0 {
+        budget.refund(-delta);
     }
 }
 
@@ -861,6 +895,8 @@ mod tests {
             Ok(AgentResponse {
                 output: format!("agent[{}]", request.task),
                 duration: Duration::from_millis(1),
+                // No reported cost: the engine falls back to cost_per_call_usd.
+                cost_usd: None,
             })
         }
     }
@@ -937,5 +973,46 @@ step = "synth"
         );
         // Two items pre-charged at the declared cost_per_call_usd.
         assert!((fan.cost_usd - 0.2).abs() < 1e-9);
+    }
+
+    // An agent that reports its real spend, like claude-code with
+    // --output-format=json.
+    struct MockAgentWithCost;
+
+    #[async_trait]
+    impl AgentProvider for MockAgentWithCost {
+        async fn run(&self, request: AgentRequest) -> crate::Result<AgentResponse> {
+            Ok(AgentResponse {
+                output: format!("agent[{}]", request.task),
+                duration: Duration::from_millis(1),
+                cost_usd: Some(0.07),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_fan_out_reconciles_to_reported_actual_cost() {
+        // Estimated $0.10/call, but the agent reports $0.07/call: the step
+        // and the budget should both settle on 2 × 0.07, not 2 × 0.10.
+        let wf = workflow("provider = \"claude-code\"\ncost_per_call_usd = 0.1");
+        let engine = Engine::new(Arc::new(MockLlm), Arc::new(MockAgentWithCost));
+        let mut budget = BudgetTracker::new(5.0);
+
+        let result = engine
+            .run(&wf, &HashMap::new(), &mut budget)
+            .await
+            .expect("workflow should succeed");
+
+        let fan = result.step_results.iter().find(|s| s.id == "fan").unwrap();
+        assert!((fan.cost_usd - 0.14).abs() < 1e-9, "got {}", fan.cost_usd);
+
+        // Whole-run spend = fan actuals + the two mock LLM steps' token cost.
+        let llm_cost: f64 = result
+            .step_results
+            .iter()
+            .filter(|s| s.id != "fan")
+            .map(|s| s.cost_usd)
+            .sum();
+        assert!((budget.spent_usd - (0.14 + llm_cost)).abs() < 1e-9);
     }
 }

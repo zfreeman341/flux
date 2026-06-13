@@ -41,12 +41,16 @@ impl CliAgentProvider {
     // CLI defines --allowedTools as variadic (<tools...>), so a bare
     // `--allowedTools WebFetch,WebSearch "<task>"` consumes the task string
     // as a second tool name and leaves the prompt argument missing.
+    // --output-format=json wraps the response in a result envelope that
+    // includes total_cost_usd — the actual API spend of the call — so budget
+    // tracking can use real numbers instead of the cost_per_call_usd guess.
     pub fn claude_code() -> Self {
         Self::new(
             "claude",
             vec![
                 "-p".to_string(),
                 "--allowedTools=WebFetch,WebSearch".to_string(),
+                "--output-format=json".to_string(),
             ],
         )
     }
@@ -132,9 +136,64 @@ impl AgentProvider for CliAgentProvider {
             )));
         }
 
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let (text, cost_usd) = parse_agent_output(&stdout);
+
         Ok(AgentResponse {
-            output: String::from_utf8_lossy(&output.stdout).trim().to_string(),
+            output: text,
             duration: start.elapsed(),
+            cost_usd,
         })
+    }
+}
+
+// Extracts the response text and actual cost from agent CLI stdout.
+//
+// claude-code with --output-format=json emits a single JSON envelope with
+// `result` (the response text) and `total_cost_usd`. Other agents (hermes)
+// emit plain text. We parse into serde_json::Value rather than a typed
+// struct because we only want two fields and must tolerate schema drift:
+// anything unexpected falls back to raw stdout with no cost, which keeps
+// existing workflows running even if the CLI's envelope changes.
+fn parse_agent_output(stdout: &str) -> (String, Option<f64>) {
+    let trimmed = stdout.trim();
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+        return (trimmed.to_string(), None);
+    };
+
+    let cost = parsed.get("total_cost_usd").and_then(|v| v.as_f64());
+    match parsed.get("result").and_then(|v| v.as_str()) {
+        Some(text) => (text.to_string(), cost),
+        // Valid JSON without a result field: keep the raw envelope so the
+        // output isn't silently lost, but still report the cost if present.
+        None => (trimmed.to_string(), cost),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_claude_json_envelope() {
+        let stdout = r#"{"type":"result","subtype":"success","result":"the answer","total_cost_usd":0.123,"num_turns":3}"#;
+        let (text, cost) = parse_agent_output(stdout);
+        assert_eq!(text, "the answer");
+        assert_eq!(cost, Some(0.123));
+    }
+
+    #[test]
+    fn json_without_result_field_keeps_envelope_and_cost() {
+        let stdout = r#"{"total_cost_usd":0.5,"weird":"shape"}"#;
+        let (text, cost) = parse_agent_output(stdout);
+        assert!(text.contains("weird"));
+        assert_eq!(cost, Some(0.5));
+    }
+
+    #[test]
+    fn plain_text_falls_back_with_no_cost() {
+        let (text, cost) = parse_agent_output("  just some text output\n");
+        assert_eq!(text, "just some text output");
+        assert_eq!(cost, None);
     }
 }

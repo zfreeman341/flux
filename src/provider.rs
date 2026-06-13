@@ -41,4 +41,8 @@ pub struct AgentRequest {
 pub struct AgentResponse {
     pub output: String,
     pub duration: Duration,
+    /// Actual API spend reported by the agent CLI, when it can report one
+    /// (claude-code's JSON output does; hermes doesn't). None means the
+    /// engine falls back to the step's cost_per_call_usd estimate.
+    pub cost_usd: Option<f64>,
 }
