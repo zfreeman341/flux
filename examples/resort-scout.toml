@@ -1,0 +1,79 @@
+# Researches luxury Caribbean resorts for a December trip.
+#
+# This workflow fans out with direct API calls (no `provider` on the
+# researcher step): each resort gets its own sonnet + web_search call at
+# roughly a tenth the cost of an agent subprocess. Use this pattern whenever
+# the per-item work is "search and summarize"; reserve agent fan-outs
+# (provider = "claude-code") for multi-hop crawling.
+
+[workflow]
+name = "Resort Scout"
+description = "Finds luxury Caribbean resorts for December, researches each in parallel, then recommends."
+output_dir = "resort-scout"
+
+[budget]
+max_usd = 1.50
+
+[inputs]
+input = { description = "Trip preferences, e.g. 'two adults, beachfront, great food, quiet'" }
+
+[[steps]]
+id = "scout"
+model = "claude-sonnet-4-6"
+tools = ["web_search"]
+max_tool_calls = 6
+prompt = """
+Find 6 luxury resorts in the Caribbean that are strong choices for a trip in
+December (peak dry season). Spread the picks across different islands, and
+favor resorts that fit these preferences: {{ input }}
+
+Output one resort per line as "Resort Name — Island". Nothing else — no
+numbers, no bullets, no commentary.
+"""
+
+[[steps]]
+id = "researcher"
+# No provider: fans out as direct API calls, one per resort.
+model = "claude-sonnet-4-6"
+tools = ["web_search"]
+max_tool_calls = 4
+parallel_over = "scout"
+depends_on = ["scout"]
+max_items = 6
+max_concurrent = 3
+prompt = """
+Research this Caribbean resort for a December stay: {{ item }}
+
+Traveler preferences: {{ input }}
+
+Cover, concisely (250-350 words):
+- December nightly rates and which room categories exist
+- The vibe: who stays here, how formal, how lively
+- Dining: signature restaurants, whether non-guests rate the food
+- Beach and water quality at the property itself
+- Getting there: nearest airport and transfer time/method
+- Anything notable from recent guest reviews, good or bad
+"""
+
+[[steps]]
+id = "synthesize"
+model = "claude-sonnet-4-6"
+depends_on = ["researcher"]
+prompt = """
+Here is research on Caribbean resorts for a December trip:
+
+{{ researcher.output }}
+
+Traveler preferences: {{ input }}
+
+Write:
+1. A comparison table: resort, island, December rate range, vibe, standout
+   feature, main drawback. Note any resorts whose research failed and exclude
+   them from recommendations.
+2. A top-3 ranking for these travelers, with the tradeoffs spelled out
+   (price vs seclusion vs dining vs beach).
+3. One booking-timing tip for December travel.
+"""
+
+[output]
+step = "synthesize"

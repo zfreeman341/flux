@@ -104,6 +104,15 @@ fn validate_accepts_agent_workflow() {
 }
 
 #[test]
+fn validate_accepts_api_fan_out_workflow() {
+    flux()
+        .args(["validate", "examples/resort-scout.toml"])
+        .assert()
+        .success()
+        .stdout(contains("is valid"));
+}
+
+#[test]
 fn explain_shows_fan_out_for_agent_step() {
     flux()
         .args(["explain", "examples/company-research.toml"])

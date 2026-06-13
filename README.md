@@ -48,6 +48,9 @@ flux explain  examples/paper-compare.toml
 
 # Run it
 flux run examples/paper-compare.toml --input topic="state-space models vs transformers"
+
+# Research isn't just papers — plan a vacation
+flux run examples/resort-scout.toml --input "two adults, beachfront, great food, quiet"
 ```
 
 The final output lands in `outputs/`, and full per-step debug artifacts
@@ -116,11 +119,11 @@ namespaced (`{{ find.output }}`).
 | `tools` | Managed server tools: `web_search`, `web_fetch`. |
 | `max_tool_calls` | Cap on tool invocations per step (default 5). |
 | `provider` | `anthropic` (default, direct API) or an agent CLI: `claude-code`, `hermes`. |
-| `parallel_over` | Fan out one agent call per line of the named upstream step's output. |
+| `parallel_over` | Fan out one call per line of the named upstream step's output. |
 | `parallel_items` | Static fan-out list, when the items are known at authoring time. |
 | `max_items` | Cap the fan-out size (protects the budget from a chatty planner). |
 | `max_concurrent` | In-flight cap for fan-out calls (default 3), via a semaphore. |
-| `cost_per_call_usd` | Budgeted cost per agent call (agents don't report token usage). |
+| `cost_per_call_usd` | Pre-charged estimate per agent call; reconciled to the actual cost the agent CLI reports. |
 | `timeout_secs` | Per-agent-call deadline (default 300). |
 | `reads_from` | Map of template variable → state file path, loaded before the step runs. |
 | `appends_to` | State file the step's output is appended to (timestamped) after it runs. |
@@ -152,7 +155,22 @@ server-side `web_search`/`web_fetch` tools. Agent steps (`AgentProvider`
 trait) shell out to an agent CLI (`claude -p ...`) for tasks that benefit
 from a full tool-using agent — e.g. crawling a site's structure rather than
 issuing one search. The traits keep providers swappable without touching the
-engine.
+engine — and make the whole engine testable against mock providers.
+
+**Choosing a fan-out type.** Both kinds can fan out in parallel; the
+`provider` field on the fan-out step picks which:
+
+| | API fan-out (default) | Agent fan-out (`provider = "claude-code"`) |
+|---|---|---|
+| Per-item cost | ~$0.05–0.15 (sonnet + a few searches) | ~$0.10–1.50 (subprocess with its own context) |
+| Latency | one API round-trip, server-side search | agent boots, plans, and crawls |
+| Best for | search-and-summarize per item | multi-hop crawling (follow links, check sub-pages) |
+| Cost accounting | exact token billing per call | actual cost reported by the claude CLI |
+
+The ~10× per-item price difference compounds: a cheaper fan-out means you can
+afford more items and more searches per item for the same budget — usually
+better coverage than fewer, heavier agents. `examples/resort-scout.toml` uses
+the API fan-out; `examples/company-research.toml` uses agents.
 
 **Budget enforcement is first-class.** Every workflow declares `max_usd`.
 Token usage is priced per step (including the per-call web-search surcharge);
@@ -194,11 +212,10 @@ access is auditable.
 
 ## Roadmap
 
-- Parallel fan-out for direct API steps (currently agent-only)
-- Required-input validation and output-step checks in `flux validate`
-- Actual cost reporting from agent CLIs instead of `cost_per_call_usd`
 - Deterministic replay of recorded runs
+- Context truncation / summarization when assembled inputs grow large
 - Workflow composition (workflows as steps)
+- Streaming output for long synthesis steps
 
 ## Development
 
