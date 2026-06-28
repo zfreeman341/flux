@@ -47,6 +47,14 @@ impl BudgetTracker {
         self.emergency = true;
     }
 
+    // True once a step has been budget-killed and we've committed to spending
+    // past the cap to finish. The pre-flight reservation guard stands down in
+    // this mode: budget enforcement is already off, so there's nothing left to
+    // protect.
+    pub fn in_emergency(&self) -> bool {
+        self.emergency
+    }
+
     // Rolls back a phantom pre-charge. Used when a parallel step pre-charges
     // for N agent calls but gets budget-killed before any agent actually runs —
     // the reported spend should reflect real API calls, not a failed estimate.

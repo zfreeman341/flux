@@ -59,8 +59,60 @@ impl Engine {
         let mut step_outputs: HashMap<String, String> = HashMap::new();
         let mut step_results: Vec<StepResult> = Vec::new();
 
+        // Reserve budget for the output step so earlier steps can't starve the
+        // synthesis that is the whole point of the run. A research fan-out that
+        // finishes just under the cap used to leave nothing for synthesis, which
+        // then got billed and discarded. Estimates are heuristic (see
+        // estimate.rs), so this is a guard rail, not a guarantee — and the output
+        // step itself is still allowed to overshoot rather than be discarded
+        // (see run_llm). Map lookups default to 0.0, which simply disables the
+        // guard for steps the estimator can't price.
+        let estimates: HashMap<String, f64> = crate::estimate::estimate_workflow(workflow)
+            .steps
+            .into_iter()
+            .map(|s| (s.id, s.cost_usd))
+            .collect();
+        let output_reserve = estimates.get(&workflow.output.step).copied().unwrap_or(0.0);
+
         for step in sorted {
             let step_start = Instant::now();
+
+            // Pre-flight reservation guard. For non-output steps, skip if running
+            // this step's estimated cost would dip into the budget reserved for
+            // the output step — better to drop a researcher and synthesize on
+            // partial results than to spend everything and have nothing left to
+            // synthesize with. The output step is exempt: it gets whatever
+            // remains. Disabled in emergency mode, where the cap is already off.
+            let is_output_step = step.id == workflow.output.step;
+            if !is_output_step && !budget.in_emergency() {
+                let step_estimate = estimates.get(&step.id).copied().unwrap_or(0.0);
+                let headroom = budget.limit_usd - budget.spent_usd - output_reserve;
+                if step_estimate > headroom {
+                    warn!(
+                        step = %step.id,
+                        estimate = format!("{:.4}", step_estimate),
+                        reserved_for_output = format!("{:.4}", output_reserve),
+                        "skipping step to preserve budget for the output step"
+                    );
+                    let output = format!(
+                        "[SKIPPED — estimated cost ${step_estimate:.2} would not leave enough \
+                         budget for the '{}' output step. Synthesis below uses the steps that ran.]",
+                        workflow.output.step
+                    );
+                    step_outputs.insert(step.id.clone(), output.clone());
+                    step_results.push(StepResult {
+                        id: step.id.clone(),
+                        model: step.provider.clone().unwrap_or_else(|| step.model.clone()),
+                        prompt: String::new(),
+                        output,
+                        input_tokens: 0,
+                        output_tokens: 0,
+                        cost_usd: 0.0,
+                        duration: step_start.elapsed(),
+                    });
+                    continue;
+                }
+            }
 
             // Augment the base inputs with any state file contents declared in reads_from.
             // Each key in reads_from becomes a template variable for this step's prompt.
@@ -210,7 +262,18 @@ impl Engine {
             response.output_tokens,
             response.web_search_requests,
         );
-        budget.add(cost)?;
+        // The call already completed and was paid for; never discard a result
+        // we bought. If this charge trips the budget, record the overshoot with
+        // a warning and return the output anyway — same contract as
+        // run_parallel_llm and reconcile_budget. Without this, the synthesis
+        // step could run, get billed, and then be thrown away for a placeholder.
+        if let Err(e) = budget.add(cost) {
+            warn!(
+                step = %step.id,
+                error = %e,
+                "llm step exceeded budget; output kept, downstream steps will be skipped"
+            );
+        }
 
         let duration = step_start.elapsed();
         info!(
@@ -1048,5 +1111,90 @@ step = "synth"
             .map(|s| s.cost_usd)
             .sum();
         assert!((budget.spent_usd - (0.14 + llm_cost)).abs() < 1e-9);
+    }
+
+    // Fix #1: a completed output step is never discarded, even if its cost
+    // pushes spend past the cap. The money is already spent; throwing the
+    // result away would mean paying for a synthesis and getting a placeholder.
+    #[tokio::test]
+    async fn output_step_is_kept_even_when_it_overshoots_budget() {
+        let wf: WorkflowFile = toml::from_str(
+            r#"
+[workflow]
+name = "t"
+[budget]
+max_usd = 1.0
+[[steps]]
+id = "only"
+prompt = "summarize the thing"
+[output]
+step = "only"
+"#,
+        )
+        .unwrap();
+        let engine = Engine::new(Arc::new(MockLlm), Arc::new(MockAgent));
+        // A budget far below any real call cost: the single step must overshoot.
+        let mut budget = BudgetTracker::new(1e-9);
+
+        let result = engine
+            .run(&wf, &HashMap::new(), &mut budget)
+            .await
+            .expect("workflow should succeed even when the output step overshoots");
+
+        // The real output is returned, not the skip placeholder.
+        assert!(result.output.contains("researched"), "{}", result.output);
+        assert!(!result.output.contains("SKIPPED"), "{}", result.output);
+        // The overshoot is recorded honestly rather than hidden.
+        assert!(budget.spent_usd > budget.limit_usd);
+    }
+
+    // Fix #2: a non-output step is skipped before it runs when its estimated
+    // cost would eat into the budget reserved for the output step. The
+    // synthesis still runs, on whatever partial results exist.
+    #[tokio::test]
+    async fn expensive_step_is_skipped_to_preserve_budget_for_output() {
+        // `plan` carries a heavy web_search estimate; `synth` is cheap. With a
+        // budget that fits synth but not plan-plus-synth, plan must give way.
+        let wf: WorkflowFile = toml::from_str(
+            r#"
+[workflow]
+name = "t"
+[budget]
+max_usd = 0.10
+[[steps]]
+id = "plan"
+prompt = "PLAN"
+tools = ["web_search"]
+max_tool_calls = 10
+[[steps]]
+id = "synth"
+prompt = "combine {{ plan.output }}"
+depends_on = ["plan"]
+[output]
+step = "synth"
+"#,
+        )
+        .unwrap();
+        let engine = Engine::new(Arc::new(MockLlm), Arc::new(MockAgent));
+        let mut budget = BudgetTracker::new(0.10);
+
+        let result = engine
+            .run(&wf, &HashMap::new(), &mut budget)
+            .await
+            .expect("workflow should succeed with the expensive step skipped");
+
+        let plan = result.step_results.iter().find(|s| s.id == "plan").unwrap();
+        assert!(plan.output.contains("SKIPPED"), "{}", plan.output);
+        assert_eq!(plan.cost_usd, 0.0);
+
+        // The output step still ran for real on the partial input.
+        let synth = result
+            .step_results
+            .iter()
+            .find(|s| s.id == "synth")
+            .unwrap();
+        assert!(synth.output.contains("researched"), "{}", synth.output);
+        // Only synth spent money, and it stayed within budget.
+        assert!(budget.spent_usd > 0.0 && budget.spent_usd <= budget.limit_usd);
     }
 }

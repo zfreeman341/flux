@@ -13,9 +13,12 @@ const CHARS_PER_TOKEN: f64 = 4.0;
 // Stand-in for an upstream step output or state file injected into a prompt.
 const ASSUMED_INPUT_REF_TOKENS: u32 = 2_000;
 // Typical response length for a research/synthesis step.
-const ASSUMED_OUTPUT_TOKENS: u32 = 1_500;
-// Search results are billed as input tokens on top of the per-search fee.
-const ASSUMED_TOKENS_PER_SEARCH: u32 = 2_000;
+const ASSUMED_OUTPUT_TOKENS: u32 = 2_000;
+// Input tokens a single web_search result adds to the conversation. Calibrated
+// against real runs (~3,500 tokens/result reproduced two web-grounded steps
+// within ~3%). This is per result; the compounding from re-sending it across
+// the tool-use loop is modeled separately in estimate_llm_step.
+const ASSUMED_TOKENS_PER_SEARCH: u32 = 3_500;
 // Must match the engine's default when a step omits max_tool_calls.
 const DEFAULT_MAX_TOOL_CALLS: u32 = 5;
 // Fan-out size guess when neither parallel_items nor max_items bounds it.
@@ -133,16 +136,28 @@ fn estimate_llm_step(step: &Step) -> StepEstimate {
         ));
     }
 
-    let mut input_tokens = prompt_tokens + input_refs * ASSUMED_INPUT_REF_TOKENS;
+    // Static context re-sent on every model call: the prompt plus any upstream
+    // outputs or state files injected as template variables.
+    let static_context = prompt_tokens + input_refs * ASSUMED_INPUT_REF_TOKENS;
+    let mut input_tokens = static_context;
     let mut search_surcharge = 0.0;
 
     if step.tools.iter().any(|t| t == "web_search") {
         let searches = step.max_tool_calls.unwrap_or(DEFAULT_MAX_TOOL_CALLS);
         search_surcharge = searches as f64 * WEB_SEARCH_COST_PER_CALL_USD;
-        input_tokens += searches * ASSUMED_TOKENS_PER_SEARCH;
+
+        // A web_search step runs a tool-use loop: searches + 1 model calls, and
+        // the conversation grows each turn. The static context is re-sent on
+        // every call, and each search result is re-sent on every later call —
+        // so result tokens compound as the triangular number S(S+1)/2, not S.
+        // This compounding is why a flat per-search estimate ran ~5x low.
+        let turns = searches + 1;
+        let compounded_results = ASSUMED_TOKENS_PER_SEARCH * searches * (searches + 1) / 2;
+        input_tokens = static_context * turns + compounded_results;
         assumptions.push(format!(
-            "{searches} web searches at ${WEB_SEARCH_COST_PER_CALL_USD}/search \
-             (+~{ASSUMED_TOKENS_PER_SEARCH} result tokens each)"
+            "{searches} web searches at ${WEB_SEARCH_COST_PER_CALL_USD}/search; \
+             ~{ASSUMED_TOKENS_PER_SEARCH} tokens/result compounded across the \
+             {turns}-turn tool loop"
         ));
     }
 
@@ -244,6 +259,43 @@ mod tests {
                 .assumptions
                 .iter()
                 .any(|a| a.contains("web searches"))
+        );
+    }
+
+    #[test]
+    fn web_search_input_compounds_across_the_tool_loop() {
+        // Each search result is re-sent on every later turn, so input grows as
+        // the triangular number S(S+1)/2 — doubling the search count more than
+        // doubles the cost. A flat per-search model (the old bug) would have
+        // made these scale linearly.
+        let two = estimate_step(&step(
+            "id = \"a\"\nprompt = \"research it\"\ntools = [\"web_search\"]\nmax_tool_calls = 2",
+        ));
+        let four = estimate_step(&step(
+            "id = \"a\"\nprompt = \"research it\"\ntools = [\"web_search\"]\nmax_tool_calls = 4",
+        ));
+        assert!(
+            four.cost_usd > 2.0 * two.cost_usd,
+            "4 searches ({}) should exceed 2x 2 searches ({})",
+            four.cost_usd,
+            two.cost_usd
+        );
+    }
+
+    #[test]
+    fn web_search_step_lands_in_the_calibrated_band() {
+        // A 4-search research step mirroring the resort/villa fan-out. Real runs
+        // put this near $0.20/item; the old flat model put it near $0.09. Guard
+        // against regressing back to the optimistic estimate.
+        let est = estimate_step(&step(
+            "id = \"r\"\nprompt = \"Research this stay; cover layout, rates, vibe, food, \
+             location, and booking reality.\"\ndepends_on = [\"scout\"]\n\
+             tools = [\"web_search\"]\nmax_tool_calls = 4",
+        ));
+        assert!(
+            est.cost_usd > 0.15 && est.cost_usd < 0.30,
+            "expected ~$0.20/item, got {}",
+            est.cost_usd
         );
     }
 
