@@ -1,3 +1,17 @@
+//! Workflow execution engine.
+//!
+//! This is the heart of the runtime: it takes a validated workflow and drives
+//! it to completion. Steps run in dependency order, computed from each step's
+//! `depends_on` edges; independent steps and `parallel_over` fan-outs execute
+//! concurrently under a [`tokio::sync::Semaphore`] that bounds how many agent
+//! calls are in flight at once (`max_concurrent`, default 3).
+//!
+//! Failures are handled by graceful skip: if a branch fails after retries, the
+//! engine records the failure and continues so that downstream synthesis steps
+//! can still run over the surviving outputs. Cost is charged to the shared
+//! [`crate::cost::BudgetTracker`] as work completes, and the run aborts once the
+//! budget ceiling is crossed.
+
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::sync::Arc;
