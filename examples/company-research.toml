@@ -17,7 +17,14 @@ model = "claude-haiku-4-5-20251001"
 prompt = """
 Generate a list of 6 companies to research related to: {{ input }}
 
-Output one company name per line. Nothing else — no numbers, no bullets, just names.
+Return the names inside a fenced block, one per line and nothing else:
+
+```
+First Company
+Second Company
+```
+
+Only the fenced block is read as the fan-out list, so any commentary outside it is safe.
 """
 
 [[steps]]

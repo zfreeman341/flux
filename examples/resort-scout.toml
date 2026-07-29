@@ -27,8 +27,14 @@ Find 6 luxury resorts in the Caribbean that are strong choices for a trip in
 December (peak dry season). Spread the picks across different islands, and
 favor resorts that fit these preferences: {{ input }}
 
-Output one resort per line as "Resort Name — Island". Nothing else — no
-numbers, no bullets, no commentary.
+Return the list inside a fenced block, one resort per line as
+"Resort Name — Island" and nothing else:
+
+```
+Example Resort — Example Island
+```
+
+Only the fenced block is read as the fan-out list, so any commentary outside it is safe.
 """
 
 [[steps]]

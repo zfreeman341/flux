@@ -1,0 +1,97 @@
+# Plans a group holiday trip: finds places that sleep 6 (3 couples) with
+# separate bedrooms or a whole villa, researches each in parallel, then
+# recommends. Fixed trip constraints (dates, party size, room layout) live in
+# the prompts; the destination and style come in via `input` so the workflow
+# is reusable for other trips.
+#
+# Like resort-scout, the researcher step has no `provider`, so it fans out as
+# direct API calls (one cheap sonnet + web_search per property) rather than
+# agent subprocesses.
+
+[workflow]
+name = "Family Villa Scout"
+description = "Finds villas / multi-room stays that sleep 6 for a December holiday week, researches each in parallel, then recommends."
+output_dir = "family-villa"
+
+[budget]
+max_usd = 2.00
+
+[inputs]
+input = { description = "Destination + style, e.g. 'Tulum, Mexico — walkable, great food, beachfront, relaxed not party'" }
+
+[[steps]]
+id = "scout"
+model = "claude-sonnet-4-6"
+tools = ["web_search"]
+max_tool_calls = 6
+prompt = """
+Find 6 places to stay for a family holiday trip with these hard requirements:
+- Destination and style: {{ input }}
+- Dates: December 23–28 (5 nights), which is peak holiday week
+- Sleeps 6 adults as 3 couples: either a whole villa/home with 3+ separate
+  bedrooms, or a resort that can give 3 separate rooms close together
+- Each couple needs their own private bedroom (no shared/bunk arrangements)
+
+Favor options that are realistically bookable for Christmas week. Spread the
+picks across a range of price points and styles (villa vs resort).
+
+Return the list inside a fenced block, one option per line as
+"Property Name — Villa or Resort — Location" and nothing else:
+
+```
+Example Property — Villa — Example Location
+```
+
+Only the fenced block is read as the fan-out list, so any commentary outside it is safe.
+"""
+
+[[steps]]
+id = "researcher"
+# No provider: fans out as direct API calls, one per property.
+model = "claude-sonnet-4-6"
+tools = ["web_search"]
+max_tool_calls = 4
+parallel_over = "scout"
+depends_on = ["scout"]
+max_items = 6
+max_concurrent = 3
+prompt = """
+Research this stay for a 3-couple group (6 adults), Dec 23–28: {{ item }}
+
+Group preferences: {{ input }}
+
+Cover, concisely (250-350 words):
+- Bedroom layout: how many separate bedrooms/bathrooms, and whether 3 couples
+  each get a private room. If it's a resort, whether 3 rooms can be booked
+  adjacent or in one block.
+- Total nightly rate for the group over Christmas week, and what's included
+  (vs. resort per-room pricing × 3).
+- The vibe: who stays here, how lively or quiet, good for a group of couples?
+- Food: on-site dining or kitchen for self-catering; quality of nearby options.
+- Location and getting there: nearest airport, transfer time, walkability.
+- Booking reality for Dec 23–28: is it likely still available, and any minimum
+  stay or holiday-week surcharge. Flag anything notable from recent reviews.
+"""
+
+[[steps]]
+id = "synthesize"
+model = "claude-sonnet-4-6"
+depends_on = ["researcher"]
+prompt = """
+Here is research on places for a 3-couple group (6 adults), Dec 23–28:
+
+{{ researcher.output }}
+
+Group preferences: {{ input }}
+
+Write:
+1. A comparison table: property, type (villa/resort), location, # separate
+   bedrooms, total group cost for 5 nights, vibe, standout feature, main
+   drawback. Note any options whose research failed and exclude them.
+2. A top-3 ranking for this group, with tradeoffs spelled out (privacy of
+   separate rooms vs. togetherness of a villa, price, food, location).
+3. One booking-timing tip specific to Christmas week — what to lock in now.
+"""
+
+[output]
+step = "synthesize"
