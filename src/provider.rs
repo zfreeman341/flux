@@ -33,9 +33,25 @@ pub struct CompletionResponse {
 
 // --- Agent provider (shells out to an external agent CLI) ---
 
+/// Whether the spend a provider reports is real money or an equivalent figure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Billing {
+    /// Metered API credits. Enforced against the workflow's budget ceiling.
+    Metered,
+    /// Charged to a subscription the CLI is signed in to. The reported cost is what the
+    /// work *would* have cost on the API, so it is tracked for visibility but never
+    /// enforced — a cap on it would abort a run that costs nothing.
+    Notional,
+}
+
 #[async_trait]
 pub trait AgentProvider: Send + Sync {
     async fn run(&self, request: AgentRequest) -> crate::Result<AgentResponse>;
+
+    /// Providers opt in to notional accounting; anything unknown is assumed to cost money.
+    fn billing(&self) -> Billing {
+        Billing::Metered
+    }
 }
 
 pub struct AgentRequest {

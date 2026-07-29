@@ -44,11 +44,17 @@ async fn run(args: flux::cli::RunArgs) -> Result<()> {
     // and burn the budget on a garbage prompt.
     flux::validator::check_required_inputs(&wf, &inputs)?;
 
-    let client =
-        flux::anthropic::AnthropicClient::from_env().context("failed to init Anthropic client")?;
     // Default agent provider is claude-code; switch to hermes if you have it installed.
     let agent = Arc::new(flux::agent::CliAgentProvider::claude_code());
-    let engine = flux::engine::Engine::new(Arc::new(client), agent);
+    // Build the API client only if some step actually needs it, so an all-agent
+    // workflow runs on the CLI's own login with no ANTHROPIC_API_KEY present.
+    let engine = if wf.steps.iter().all(|s| s.is_agent()) {
+        flux::engine::Engine::agents_only(agent)
+    } else {
+        let client = flux::anthropic::AnthropicClient::from_env()
+            .context("failed to init Anthropic client")?;
+        flux::engine::Engine::new(Arc::new(client), agent)
+    };
     let mut budget = flux::cost::BudgetTracker::new(wf.budget.max_usd);
 
     let result = engine
@@ -81,6 +87,12 @@ async fn run(args: flux::cli::RunArgs) -> Result<()> {
         wf.budget.max_usd,
         result.duration.as_secs_f64()
     );
+    if result.notional_usd > 0.0 {
+        eprintln!(
+            "        plus ${:.4} billed to the agent CLI's own plan (not charged against the budget)",
+            result.notional_usd
+        );
+    }
 
     Ok(())
 }
@@ -155,7 +167,7 @@ fn write_run_artifacts(
     let output_path = out_dir.join(&output_filename);
 
     let output_md = format!(
-        "# {name}\n\n{desc}**Cost:** ${cost:.4}  \n**Duration:** {dur:.1}s\n\n---\n\n{output}\n",
+        "# {name}\n\n{desc}**Cost:** ${cost:.4}{notional}  \n**Duration:** {dur:.1}s\n\n---\n\n{output}\n",
         name = wf.workflow.name,
         desc = wf
             .workflow
@@ -164,6 +176,7 @@ fn write_run_artifacts(
             .map(|d| format!("{d}\n\n"))
             .unwrap_or_default(),
         cost = result.spent_usd,
+        notional = notional_note(result.notional_usd),
         dur = result.duration.as_secs_f64(),
         output = result.output,
     );
@@ -207,14 +220,25 @@ fn write_run_artifacts(
         .collect();
 
     let summary = format!(
-        "# Run Summary\n\nWorkflow: **{name}**  \nTotal cost: **${cost:.4}**  \nDuration: **{dur:.1}s**\n\n## Steps\n\n| Step | Model | In tokens | Out tokens | Cost | Duration |\n|------|-------|-----------|------------|------|----------|\n{rows}",
+        "# Run Summary\n\nWorkflow: **{name}**  \nTotal cost: **${cost:.4}**{notional}  \nDuration: **{dur:.1}s**\n\n## Steps\n\n| Step | Model | In tokens | Out tokens | Cost | Duration |\n|------|-------|-----------|------------|------|----------|\n{rows}",
         name = wf.workflow.name,
         cost = result.spent_usd,
+        notional = notional_note(result.notional_usd),
         dur = result.duration.as_secs_f64(),
     );
     std::fs::write(dir.join("summary.md"), summary)?;
 
     Ok(output_path)
+}
+
+// Subscription-billed spend is reported alongside real spend but labelled, so an artifact
+// read months later can't be mistaken for a bill.
+fn notional_note(notional_usd: f64) -> String {
+    if notional_usd > 0.0 {
+        format!(" (+ ${notional_usd:.4} notional, billed to the agent CLI's own plan)")
+    } else {
+        String::new()
+    }
 }
 
 // Converts a string to a filename-safe slug: lowercase, runs of
@@ -310,6 +334,12 @@ fn explain(args: flux::cli::ExplainArgs) -> Result<()> {
         );
     }
     println!("(Estimates are heuristic: pre-run token counts and fan-out sizes are unknown.)");
+    if wf.steps.iter().any(|s| s.is_agent()) {
+        println!(
+            "(Agent steps bill the CLI's own login, so their cost is notional — what the \
+             work would cost on the API — and is not charged against the budget.)"
+        );
+    }
     Ok(())
 }
 

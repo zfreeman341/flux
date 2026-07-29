@@ -16,6 +16,10 @@ pub const WEB_SEARCH_COST_PER_CALL_USD: f64 = 0.01;
 pub struct BudgetTracker {
     pub limit_usd: f64,
     pub spent_usd: f64,
+    /// Subscription-billed spend, reported for visibility but never enforced against the
+    /// limit. Kept separate from spent_usd so a run that costs nothing can't be aborted by
+    /// the API-equivalent figures an agent CLI reports.
+    pub notional_usd: f64,
     // When true, add() accumulates cost but never errors. Enabled after a step
     // is skipped due to budget so the output step can still synthesize partial results.
     emergency: bool,
@@ -26,8 +30,14 @@ impl BudgetTracker {
         Self {
             limit_usd,
             spent_usd: 0.0,
+            notional_usd: 0.0,
             emergency: false,
         }
+    }
+
+    /// Records spend that isn't real money. Never fails: there is no ceiling to breach.
+    pub fn add_notional(&mut self, cost: f64) {
+        self.notional_usd += cost;
     }
 
     pub fn add(&mut self, cost: f64) -> crate::Result<()> {

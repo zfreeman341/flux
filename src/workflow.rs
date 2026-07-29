@@ -72,6 +72,17 @@ pub struct Step {
     pub timeout_secs: Option<u64>,
 }
 
+impl Step {
+    /// True when this step runs through an external agent CLI rather than the Anthropic API.
+    /// Single source of truth for provider dispatch, shared by the engine and the estimator.
+    pub fn is_agent(&self) -> bool {
+        matches!(
+            self.provider.as_deref(),
+            Some("hermes") | Some("claude-code")
+        )
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct Output {
     pub step: String,

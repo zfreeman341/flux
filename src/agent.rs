@@ -5,7 +5,7 @@ use tracing::{debug, instrument};
 
 use crate::{
     FluxError,
-    provider::{AgentProvider, AgentRequest, AgentResponse},
+    provider::{AgentProvider, AgentRequest, AgentResponse, Billing},
 };
 
 // A generic agent provider that shells out to any CLI tool.
@@ -20,6 +20,7 @@ pub struct CliAgentProvider {
     // Args inserted between the binary and the task string.
     // e.g., ["-p"] for claude, ["-z"] for hermes.
     args: Vec<String>,
+    scrub_api_key: bool,
 }
 
 impl CliAgentProvider {
@@ -27,7 +28,16 @@ impl CliAgentProvider {
         Self {
             binary: binary.into(),
             args,
+            scrub_api_key: false,
         }
+    }
+
+    /// Hides ANTHROPIC_API_KEY from the subprocess so the CLI falls back to its own
+    /// interactive login. Claude Code prefers the env key when present, which would
+    /// bill metered API credits instead of the subscription already signed in.
+    pub fn without_api_key(mut self) -> Self {
+        self.scrub_api_key = true;
+        self
     }
 
     // Factory: `claude -p --allowedTools=WebFetch,WebSearch "<task>"`
@@ -53,6 +63,7 @@ impl CliAgentProvider {
                 "--output-format=json".to_string(),
             ],
         )
+        .without_api_key()
     }
 
     // Factory: `hermes -z "<task>"`
@@ -63,6 +74,16 @@ impl CliAgentProvider {
 
 #[async_trait]
 impl AgentProvider for CliAgentProvider {
+    // Hiding the API key forces the CLI onto its own login, so whatever it reports is an
+    // API-equivalent figure rather than money spent.
+    fn billing(&self) -> Billing {
+        if self.scrub_api_key {
+            Billing::Notional
+        } else {
+            Billing::Metered
+        }
+    }
+
     // #[instrument] attaches a tracing span to this function.
     // skip(self, request) keeps the span fields tidy — we log what matters explicitly.
     #[instrument(skip(self, request), fields(binary = %self.binary))]
@@ -87,14 +108,14 @@ impl AgentProvider for CliAgentProvider {
         // tokio::time::timeout wraps any future with a deadline. If the future
         // doesn't complete within the duration, it returns Err(Elapsed).
         // We map that into our own FluxError::Agent before surfacing it.
-        let result = tokio::time::timeout(
-            Duration::from_secs(request.timeout_secs),
-            tokio::process::Command::new(&self.binary)
-                .args(&self.args)
-                .arg(&task)
-                .output(),
-        )
-        .await;
+        let mut command = tokio::process::Command::new(&self.binary);
+        if self.scrub_api_key {
+            command.env_remove("ANTHROPIC_API_KEY");
+        }
+        command.args(&self.args).arg(&task);
+
+        let result =
+            tokio::time::timeout(Duration::from_secs(request.timeout_secs), command.output()).await;
 
         // Two layers of Result to unwrap:
         //   outer: Err(Elapsed) if timed out

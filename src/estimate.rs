@@ -50,12 +50,8 @@ fn estimate_step(step: &Step) -> StepEstimate {
     // priced per call; everything else is direct API calls priced by tokens —
     // including parallel steps, which fan out one API call per item.
     let is_parallel = step.parallel_over.is_some() || !step.parallel_items.is_empty();
-    let is_agent = matches!(
-        step.provider.as_deref(),
-        Some("hermes") | Some("claude-code")
-    );
 
-    if is_agent {
+    if step.is_agent() {
         estimate_agent_step(step, is_parallel)
     } else if is_parallel {
         estimate_parallel_llm_step(step)
