@@ -31,13 +31,9 @@ use crate::{
     workflow::{Step, WorkflowFile},
 };
 
-// The run's budget tracker, shared by every step in a wave. Wrapping the caller's borrow
-// rather than an owned tracker keeps `run`'s signature unchanged and avoids the 'static
-// bound that spawning tasks would impose.
+// Wraps the caller's borrow so steps in a wave can share it without a 'static bound.
 type BudgetLock<'a> = Mutex<&'a mut BudgetTracker>;
 
-// Everything a step needs from the surrounding run. Bundled because threading seven
-// parameters through each step call was unreadable.
 struct StepContext<'a> {
     workflow: &'a WorkflowFile,
     inputs: &'a HashMap<String, String>,
@@ -48,10 +44,6 @@ struct StepContext<'a> {
 }
 
 pub struct Engine {
-    // Arc (atomic reference count) instead of Box because we clone these handles
-    // for each concurrent task in a parallel fan-out. Box gives unique ownership
-    // (one owner); Arc gives shared ownership (many owners, freed when all drop).
-    // The types must be Send + Sync because they cross task/thread boundaries.
     // None when no API key was configured, which is valid if every step is an agent step.
     llm: Option<Arc<dyn LlmProvider>>,
     agent: Arc<dyn AgentProvider>,
@@ -92,8 +84,7 @@ impl Engine {
         Self { llm: None, agent }
     }
 
-    // True when this step's cost is an API-equivalent figure rather than money, which means
-    // it neither needs a pre-charge nor counts against the budget ceiling.
+    // Cost is an API-equivalent figure, so it needs no pre-charge and no ceiling check.
     fn is_notional(&self, step: &Step) -> bool {
         step.is_agent() && self.agent.billing() == Billing::Notional
     }
@@ -119,14 +110,7 @@ impl Engine {
         let mut step_outputs: HashMap<String, String> = HashMap::new();
         let mut step_results: Vec<StepResult> = Vec::new();
 
-        // Reserve budget for the output step so earlier steps can't starve the
-        // synthesis that is the whole point of the run. A research fan-out that
-        // finishes just under the cap used to leave nothing for synthesis, which
-        // then got billed and discarded. Estimates are heuristic (see
-        // estimate.rs), so this is a guard rail, not a guarantee — and the output
-        // step itself is still allowed to overshoot rather than be discarded
-        // (see run_llm). Map lookups default to 0.0, which simply disables the
-        // guard for steps the estimator can't price.
+        // Reserved so a fan-out finishing just under the cap cannot starve the synthesis.
         let estimates: HashMap<String, f64> = crate::estimate::estimate_workflow(workflow)
             .steps
             .into_iter()
@@ -149,9 +133,7 @@ impl Engine {
         for (index, wave) in dependency_waves(&workflow.steps).into_iter().enumerate() {
             info!(wave = index, steps = wave.len(), "starting wave");
 
-            // Steps in a wave share no dependency edges, so they can run together. Their
-            // reads of step_outputs stay immutable until the whole wave has finished,
-            // which is what makes the concurrency safe without cloning the map.
+            // step_outputs stays immutable until the wave finishes, so no clone is needed.
             let wave_results = {
                 let ctx = StepContext {
                     workflow,
@@ -191,9 +173,7 @@ impl Engine {
         })
     }
 
-    // Runs one step to completion. Recoverable failures become a placeholder result rather
-    // than an error, so a downstream synthesizer still has something to work with; only
-    // genuinely fatal errors propagate.
+    // Recoverable failures become a placeholder result so the synthesizer still has input.
     async fn execute_step(
         &self,
         step: &Step,
@@ -202,15 +182,7 @@ impl Engine {
     ) -> crate::Result<StepResult> {
         let step_start = Instant::now();
 
-        // Pre-flight reservation guard. For non-output steps, skip if running
-        // this step's estimated cost would dip into the budget reserved for
-        // the output step — better to drop a researcher and synthesize on
-        // partial results than to spend everything and have nothing left to
-        // synthesize with. The output step is exempt: it gets whatever
-        // remains. Disabled in emergency mode, where the cap is already off.
-        // Concurrent steps in a wave each check against the same snapshot, so a wave can
-        // still overshoot by one step's estimate — the same bounded window the parallel
-        // fan-out already accepts.
+        // Steps in a wave check the same snapshot, so a wave can overshoot by one estimate.
         let is_output_step = step.id == ctx.workflow.output.step;
         if !is_output_step && !self.is_notional(step) {
             let step_estimate = ctx.estimates.get(&step.id).copied().unwrap_or(0.0);
@@ -238,12 +210,9 @@ impl Engine {
             }
         }
 
-        // Augment the base inputs with any state file contents declared in reads_from.
-        // Each key in reads_from becomes a template variable for this step's prompt.
         let step_inputs = load_state_for_step(step, ctx.inputs)?;
 
-        // Snapshot budget before this step so we can refund a parallel pre-charge
-        // if the step gets budget-killed before any agents actually run.
+        // Snapshot so a pre-charge can be refunded if the step dies before any agent runs.
         let pre_step_spent = budget.lock().await.spent_usd;
 
         let attempt = if step.parallel_over.is_some() || !step.parallel_items.is_empty() {
@@ -257,18 +226,12 @@ impl Engine {
                 .await
         };
 
-        // On BudgetExceeded: skip this step, inject a placeholder so downstream
-        // steps (the synthesizer) can still run on whatever results exist.
-        // enable_emergency() disables further budget checks so the output step
-        // can spend a small amount to synthesize partial results — better than
-        // returning nothing at all.
         let step_result = match attempt {
             Ok(r) => r,
+            // enable_emergency below lifts the cap so the output step can still synthesize.
             Err(FluxError::BudgetExceeded { spent, limit }) => {
                 let mut tracker = budget.lock().await;
-                // Parallel steps pre-charge for all N items before any agent runs.
-                // If that pre-charge itself caused the budget exceeded, no real
-                // money was spent — refund it so reported spend stays honest.
+                // A pre-charge that tripped the cap spent no real money, so refund it.
                 if step.parallel_over.is_some() {
                     let phantom = spent - pre_step_spent;
                     if phantom > 0.0 {
@@ -296,9 +259,6 @@ impl Engine {
                     step_start,
                 )
             }
-            // Template errors mean a variable was missing or malformed.
-            // Rather than aborting the whole run, inject a clear placeholder
-            // so downstream steps (the synthesizer) still produce output.
             Err(FluxError::Template(ref msg)) => {
                 warn!(step = %step.id, error = %msg, "template error; skipping step with placeholder");
                 skipped_step(
@@ -314,8 +274,7 @@ impl Engine {
             Err(e) => return Err(e),
         };
 
-        // Append the step's output to the configured state file, if any.
-        // Failure here is non-fatal — warn loudly but don't abort the run.
+        // Non-fatal: a state file that cannot be written must not sink the run.
         if let Some(ref path) = step.appends_to
             && let Err(e) = append_to_state(
                 path,
@@ -359,11 +318,7 @@ impl Engine {
             response.output_tokens,
             response.web_search_requests,
         );
-        // The call already completed and was paid for; never discard a result
-        // we bought. If this charge trips the budget, record the overshoot with
-        // a warning and return the output anyway — same contract as
-        // run_parallel_llm and reconcile_budget. Without this, the synthesis
-        // step could run, get billed, and then be thrown away for a placeholder.
+        // Already paid for, so never discard it: record the overshoot and return the output.
         if let Err(e) = budget.lock().await.add(cost) {
             warn!(
                 step = %step.id,
@@ -406,8 +361,7 @@ impl Engine {
         let provider_name = step.provider.as_deref().unwrap_or("agent");
         info!(step = %step.id, provider = %provider_name, "executing agent step");
 
-        // Pre-charging only makes sense for real money; resolve_cost is skipped entirely
-        // when notional so it can't warn about a cost_per_call_usd that wouldn't be used.
+        // Skipped when notional so it cannot warn about an unused cost_per_call_usd.
         let notional = self.is_notional(step);
         let estimated = if notional {
             0.0
@@ -457,9 +411,6 @@ impl Engine {
         })
     }
 
-    // Fans out over a list of items, running one agent call per item with bounded
-    // concurrency. Items come from either parallel_items (static TOML list) or by
-    // parsing the output of the upstream step named in parallel_over.
     async fn run_parallel(
         &self,
         step: &Step,
@@ -468,9 +419,7 @@ impl Engine {
         budget: &BudgetLock<'_>,
         step_start: Instant,
     ) -> crate::Result<StepResult> {
-        // Resolve items from whichever source is configured. parallel_items takes
-        // a static list directly from the TOML; parallel_over parses lines from
-        // an upstream step's output. The validator guarantees exactly one is set.
+        // The validator guarantees exactly one of the two item sources is set.
         let mut items: Vec<String> = if !step.parallel_items.is_empty() {
             step.parallel_items.clone()
         } else {
@@ -502,10 +451,7 @@ impl Engine {
             parsed
         };
 
-        // max_items caps the fan-out so a chatty planner output doesn't pre-charge
-        // the budget for 25 items when you only wanted 6. The planner may output
-        // formatted text (descriptions, headers) despite instructions — this is the
-        // safety valve. A warning makes the truncation visible in logs.
+        // Safety valve for a chatty planner: cap the fan-out rather than trust the count.
         if let Some(cap) = step.max_items
             && items.len() > cap
         {
@@ -518,15 +464,10 @@ impl Engine {
             items.truncate(cap);
         }
 
-        // Build (item, rendered_prompt) pairs synchronously before entering any
-        // async block — and before any budget charge, so a template error can't
-        // leave a phantom pre-charge behind. render_prompt borrows step_outputs
-        // safely without cloning the whole map into every future.
+        // Rendered before any budget charge, so a template error leaves no phantom charge.
         let item_prompts: Vec<(String, String)> = items
             .iter()
             .map(|item| {
-                // Inject {{ item }} as a top-level template variable by cloning
-                // inputs (which is small) and adding the key for this iteration.
                 let mut inputs_with_item = inputs.clone();
                 inputs_with_item.insert("item".to_string(), item.clone());
                 let prompt =
@@ -537,8 +478,6 @@ impl Engine {
 
         info!(step = %step.id, items = item_prompts.len(), "starting parallel fan-out");
 
-        // Dispatch on provider: agent CLIs fan out as subprocesses; everything
-        // else fans out as direct API calls, honoring the step's model and tools.
         if step.is_agent() {
             self.run_parallel_agent(step, item_prompts, budget, step_start)
                 .await
@@ -548,10 +487,7 @@ impl Engine {
         }
     }
 
-    // Agent fan-out: one subprocess per item. Cost is pre-charged from
-    // cost_per_call_usd before any agent fires — agents don't report usage
-    // up front, and an N-item fan-out must not over-commit the budget.
-    // Failed calls are refunded after the fact.
+    // One subprocess per item, pre-charged because agents do not report usage up front.
     async fn run_parallel_agent(
         &self,
         step: &Step,
@@ -560,9 +496,7 @@ impl Engine {
         step_start: Instant,
     ) -> crate::Result<StepResult> {
         let n = item_prompts.len();
-        // Resolve the per-call estimate once: it's both the pre-charge unit
-        // and the fallback for agents that don't report actual cost.
-        // Subscription-billed steps skip both — there is no real money to over-commit.
+        // Both the pre-charge unit and the fallback for agents that report no cost.
         let notional = self.is_notional(step);
         let per_call = if notional {
             0.0
@@ -573,23 +507,11 @@ impl Engine {
             budget.lock().await.add(per_call * n as f64)?;
         }
 
-        // Semaphore limits how many agent processes can be in-flight at once.
-        // Arc because each async block in the map below takes ownership of a clone.
-        // The semaphore itself lives on the heap; Arc is just the handle.
         let semaphore = Arc::new(Semaphore::new(step.max_concurrent.unwrap_or(3)));
-
-        // Clone the Arc for use inside the futures. Cloning an Arc is cheap:
-        // it increments an atomic counter, no heap allocation.
         let agent = Arc::clone(&self.agent);
         let step_id = step.id.clone();
-        // Capture as a plain u64 so it can be copied into each async move block
-        // without needing a clone or borrow. u64 is Copy.
         let timeout_secs = step.timeout_secs.unwrap_or(300);
 
-        // Build the Vec of futures without spawning threads. join_all polls them
-        // concurrently on the current task. Since the actual work (subprocess) is
-        // OS-level, true parallelism happens regardless — the semaphore just limits
-        // how many we start at once.
         let futures: Vec<_> = item_prompts
             .into_iter()
             .map(|(item, prompt)| {
@@ -597,9 +519,7 @@ impl Engine {
                 let agent = Arc::clone(&agent);
                 let step_id = step_id.clone();
                 async move {
-                    // acquire() waits until a semaphore permit is available,
-                    // then returns a SemaphorePermit that releases on drop.
-                    // unwrap() is safe here: the semaphore is never closed.
+                    // Bound to a name so the permit lives for the whole block, not one line.
                     let _permit = sem.acquire().await.unwrap();
                     info!(step = %step_id, item = %item, "agent call start");
                     let result = agent
@@ -615,10 +535,7 @@ impl Engine {
 
         let results = join_all(futures).await;
 
-        // Refund pre-charged cost for every call that failed. The pre-charge
-        // prevents over-committing the budget before agents fire, but a failed
-        // call (bad invocation, immediate exit, permission error) incurs no real
-        // API spend — don't report it as money spent.
+        // A failed call incurs no real spend, so do not report it as money spent.
         let failed_count = results.iter().filter(|(_, r)| r.is_err()).count();
         if failed_count > 0 && !notional {
             let refund = per_call * failed_count as f64;
@@ -653,8 +570,7 @@ impl Engine {
             }
         }
 
-        // Replace the estimated charge for the calls that ran with what the
-        // agents actually reported spending.
+        // Replace the estimate for the calls that ran with what the agents reported.
         if notional {
             budget.lock().await.add_notional(actual_cost);
         } else {
@@ -686,18 +602,7 @@ impl Engine {
         })
     }
 
-    // API fan-out: one direct Anthropic call per item, honoring the step's
-    // model and tools. Roughly an order of magnitude cheaper per item than an
-    // agent subprocess for search-and-summarize work, and rate limits are
-    // handled by the client's own 429 backoff.
-    //
-    // Budgeting differs from the agent path: there is no pre-charge, because
-    // actual token costs are only known after each call returns, and updating
-    // the budget from inside concurrent futures would need a Mutex. Instead
-    // the summed actual cost is charged once after join_all. The overshoot
-    // window is bounded by (items × per-item cost) — small for API calls,
-    // which is exactly why the agent path keeps its pre-charge and this one
-    // doesn't.
+    // No pre-charge: token costs are only known afterwards, and the overshoot is small.
     async fn run_parallel_llm(
         &self,
         step: &Step,
@@ -709,7 +614,6 @@ impl Engine {
         let llm = Arc::clone(self.require_llm()?);
         let step_id = step.id.clone();
         let max_tool_calls = step.max_tool_calls.unwrap_or(5);
-        // Option<u32> is Copy, so each async move block gets its own copy.
         let max_tokens = step.max_tokens;
 
         let futures: Vec<_> = item_prompts
@@ -718,8 +622,7 @@ impl Engine {
                 let sem = Arc::clone(&semaphore);
                 let llm = Arc::clone(&llm);
                 let step_id = step_id.clone();
-                // Clone per future: each async move block takes ownership of
-                // its own copies, so nothing borrows `step` across an await.
+                // Cloned per future so nothing borrows `step` across an await.
                 let model = step.model.clone();
                 let tools = step.tools.clone();
                 async move {
@@ -769,9 +672,7 @@ impl Engine {
             }
         }
 
-        // Charge actual spend. If this trips the budget the money is already
-        // spent and the outputs exist — keep them, record the spend, and let
-        // the next step's charge trigger the graceful-skip path.
+        // Already spent, so keep the outputs and let the next step trip the skip path.
         if let Err(e) = budget.lock().await.add(total_cost) {
             warn!(
                 step = %step.id,
@@ -804,8 +705,7 @@ impl Engine {
     }
 }
 
-// A zero-cost placeholder result standing in for a step that never ran, carrying an
-// explanation the synthesizer can read as ordinary prompt text.
+// The explanation is ordinary prose so the synthesizer can read it as prompt text.
 fn skipped_step(step: &Step, output: String, step_start: Instant) -> StepResult {
     StepResult {
         id: step.id.clone(),
@@ -819,10 +719,7 @@ fn skipped_step(step: &Step, output: String, step_start: Instant) -> StepResult 
     }
 }
 
-// Appends a Sources section to a step's output so cited URLs flow into
-// downstream prompts, the final result, and run artifacts. Verifiability is
-// the point of capturing citations — keep them attached to the text they
-// support.
+// Attached to the output so citations flow into downstream prompts and run artifacts.
 fn append_sources(mut output: String, sources: &[String]) -> String {
     if sources.is_empty() {
         return output;
@@ -836,11 +733,7 @@ fn append_sources(mut output: String, sources: &[String]) -> String {
     output
 }
 
-// Adjusts the budget after actual costs come in, replacing what was
-// pre-charged from estimates. A positive delta can trip the limit — but at
-// that point the money is already spent, so record it with a warning and let
-// the next step's charge trigger the graceful-skip path, rather than
-// discarding work that already happened (and was already paid for).
+// Replaces what was pre-charged from estimates once the actual cost is known.
 async fn reconcile_budget(budget: &BudgetLock<'_>, step_id: &str, delta: f64) {
     if delta > 0.0 {
         if let Err(e) = budget.lock().await.add(delta) {
@@ -855,9 +748,7 @@ async fn reconcile_budget(budget: &BudgetLock<'_>, step_id: &str, delta: f64) {
     }
 }
 
-// Loads state files declared in a step's reads_from map and merges them into
-// a copy of base_inputs. Missing files produce a warning and inject an empty
-// string so first-run workflows work before any state has been accumulated.
+// A missing file injects an empty string so a first run works before state exists.
 fn load_state_for_step(
     step: &crate::workflow::Step,
     base_inputs: &HashMap<String, String>,
@@ -887,10 +778,7 @@ fn load_state_for_step(
     Ok(inputs)
 }
 
-// Reads a state path that may be either a file or a directory.
-// For a file: returns its contents, or None if it doesn't exist.
-// For a directory: returns the contents of the most recently modified file
-// in the directory, or None if the directory is empty or doesn't exist.
+/// Reads a file, or the most recently modified file when given a directory.
 fn read_state_path(path: &str) -> crate::Result<Option<String>> {
     let p = std::path::Path::new(path);
 
@@ -900,7 +788,6 @@ fn read_state_path(path: &str) -> crate::Result<Option<String>> {
             .filter(|e| e.path().is_file())
             .collect();
 
-        // Sort by modification time so the most recent file is last.
         entries.sort_by_key(|e| {
             e.metadata()
                 .and_then(|m| m.modified())
@@ -924,8 +811,7 @@ fn read_state_path(path: &str) -> crate::Result<Option<String>> {
     }
 }
 
-// Appends a step's output to a state file with a timestamped header.
-// Creates the file (and any parent directories) if it doesn't exist.
+// Creates the file and any parent directories if they do not exist.
 fn append_to_state(
     raw_path: &str,
     output: &str,
@@ -949,14 +835,10 @@ fn append_to_state(
     Ok(())
 }
 
-// Extracts fan-out items from an upstream step's output, returning the items and whether
-// they came from a fenced block.
-//
-// A planner told to emit "one name per line" will still often add a sentence of preamble,
-// and line-splitting alone turns that sentence into a research target — which both wastes
-// a call and can push a real item past `max_items`. So a fenced block, if present, wins:
-// it is the only part of the output the planner explicitly marked as data. Without one we
-// fall back to line-splitting and the caller warns.
+/// Returns the fan-out items and whether they came from a fenced block.
+///
+/// A fenced block wins because it is the only part of the output a planner explicitly
+/// marked as data; line-splitting alone turns a sentence of preamble into a research target.
 fn parse_fan_out_items(output: &str) -> (Vec<String>, bool) {
     match last_fenced_block(output) {
         Some(block) => (parse_item_lines(&block), true),
@@ -964,13 +846,12 @@ fn parse_fan_out_items(output: &str) -> (Vec<String>, bool) {
     }
 }
 
-// Returns the contents of the last non-empty fenced block. Last rather than first because
-// a planner that reasons before answering puts its data at the end.
+// Last rather than first, because a planner that reasons first answers at the end.
 fn last_fenced_block(output: &str) -> Option<String> {
     let mut blocks: Vec<String> = Vec::new();
     let mut current: Option<Vec<&str>> = None;
     for line in output.lines() {
-        // Anything after the fence is a language tag, so only the prefix matters.
+        // Only the prefix matters: anything after it is a language tag.
         if line.trim_start().starts_with("```") {
             match current.take() {
                 Some(lines) => blocks.push(lines.join("\n")),
@@ -991,10 +872,7 @@ fn last_fenced_block(output: &str) -> Option<String> {
     blocks.into_iter().rev().find(|b| !b.trim().is_empty())
 }
 
-// Strips lines that are clearly decorative rather than list items: blank lines, markdown
-// headers, and lines with no alphanumeric content (e.g. "---", "==="). The old heuristic
-// (len <= 80) was wrong for structured output like "Company | Role | https://..." which
-// can be well over 80 chars.
+// Drops decorative lines: blank, markdown headers, and rules like "---" or "===".
 fn parse_item_lines(text: &str) -> Vec<String> {
     text.lines()
         .filter(|l| !l.trim().is_empty())
@@ -1004,17 +882,14 @@ fn parse_item_lines(text: &str) -> Vec<String> {
         .collect()
 }
 
-// Strips common markdown list markers from the start of a line so planners
-// that add bullets ("- Acme", "1. Acme") still produce clean item strings.
+// So a planner that adds bullets ("- Acme", "1. Acme") still yields clean item strings.
 fn strip_list_marker(s: &str) -> &str {
-    // Numbered: "1. ", "12. "
     if let Some(rest) = s.split_once(". ")
         && rest.0.chars().all(|c| c.is_ascii_digit())
         && !rest.0.is_empty()
     {
         return rest.1;
     }
-    // Unordered: "- ", "* ", "• "
     for prefix in &["- ", "* ", "• "] {
         if let Some(rest) = s.strip_prefix(prefix) {
             return rest;
@@ -1023,11 +898,9 @@ fn strip_list_marker(s: &str) -> &str {
     s
 }
 
-// Groups steps into dependency waves: everything in wave N depends only on steps in
-// earlier waves, so a wave's steps can all run at once. This replaces a flat topological
-// sort, which was correct about ordering but forced independent steps to run one at a time.
-//
-// Waves preserve declaration order within each level, so a run's step order is stable.
+/// Groups steps so that everything in wave N depends only on earlier waves.
+///
+/// Declaration order is preserved within each wave, keeping a run's step order stable.
 fn dependency_waves(steps: &[Step]) -> Vec<Vec<&Step>> {
     let by_id: HashMap<&str, &Step> = steps.iter().map(|s| (s.id.as_str(), s)).collect();
     let mut depths: HashMap<&str, usize> = HashMap::new();
@@ -1038,8 +911,7 @@ fn dependency_waves(steps: &[Step]) -> Vec<Vec<&Step>> {
     let Some(&deepest) = depths.values().max() else {
         return Vec::new();
     };
-    // Every level up to the deepest is populated: a step at depth d must have a dependency
-    // at depth d-1, so no wave can be empty.
+    // No wave can be empty: a step at depth d must have a dependency at depth d-1.
     let mut waves: Vec<Vec<&Step>> = vec![Vec::new(); deepest + 1];
     for step in steps {
         waves[depths[step.id.as_str()]].push(step);
@@ -1047,8 +919,7 @@ fn dependency_waves(steps: &[Step]) -> Vec<Vec<&Step>> {
     waves
 }
 
-// A step's depth is one past its deepest dependency. Memoized, so each step is resolved
-// once no matter how many dependents it has.
+// One past the deepest dependency, memoized so each step resolves once.
 fn step_depth<'a>(
     id: &'a str,
     by_id: &HashMap<&'a str, &'a Step>,
@@ -1057,9 +928,7 @@ fn step_depth<'a>(
     if let Some(&depth) = depths.get(id) {
         return depth;
     }
-    // Provisional entry so a cycle terminates here rather than overflowing the stack. The
-    // validator rejects cycles before a run, so this only guards against reaching the
-    // engine with an unvalidated workflow.
+    // Provisional entry so a cycle terminates here instead of overflowing the stack.
     depths.insert(id, 0);
     let depth = by_id[id]
         .depends_on
@@ -1075,8 +944,7 @@ fn step_depth<'a>(
 mod tests {
     use super::*;
 
-    // Deserialize from TOML instead of writing 15-field struct literals —
-    // exercises the same parse path real workflows use.
+    // Via TOML rather than struct literals, so tests use the same parse path as real runs.
     fn step(src: &str) -> Step {
         toml::from_str(src).expect("test step TOML should parse")
     }
@@ -1102,8 +970,7 @@ mod tests {
         );
     }
 
-    // The payoff of waves over a flat sort: b and c are independent, so they land in the
-    // same wave and actually run at the same time.
+    // The payoff over a flat sort: b and c are independent, so they share a wave.
     #[test]
     fn independent_branches_of_a_diamond_share_a_wave() {
         let steps = vec![
@@ -1151,9 +1018,7 @@ mod tests {
         assert_eq!(strip_list_marker("12. Acme"), "Acme");
     }
 
-    // The exact failure that cost a research slot on a real run: a planner prefaced its
-    // list with a sentence, which became a fan-out item and pushed a real company past
-    // max_items.
+    // The exact failure that cost a research slot on a real run.
     #[test]
     fn fenced_block_wins_over_planner_preamble() {
         let output = "After cross-referencing the exclusion list, here are 6 companies:\n\n\
@@ -1171,7 +1036,6 @@ mod tests {
         assert_eq!(items, vec!["Acme", "Borealis"]);
     }
 
-    // A planner that reasons in one block and answers in another means the answer is last.
     #[test]
     fn last_fenced_block_wins() {
         let output = "```\nscratch work\n```\nokay, final:\n```\nAcme\nBorealis\n```";
@@ -1208,11 +1072,7 @@ mod tests {
         assert_eq!(strip_list_marker("Inc. Acme"), "Inc. Acme");
     }
 
-    // --- end-to-end engine tests with mock providers ---
-    //
-    // Implementing the provider traits on test doubles is the payoff of the
-    // trait-object design: the whole engine runs against canned responses
-    // with no network, no API key, and no money.
+    // End-to-end tests: mock providers let the whole engine run with no network or money.
 
     use crate::provider::{AgentResponse, CompletionResponse};
     use async_trait::async_trait;
@@ -1222,8 +1082,7 @@ mod tests {
     #[async_trait]
     impl LlmProvider for MockLlm {
         async fn complete(&self, request: CompletionRequest) -> crate::Result<CompletionResponse> {
-            // A planner prompt yields two fan-out items; anything else echoes
-            // its prompt so tests can see exactly which call produced what.
+            // Non-planner prompts echo back, so a test can see which call produced what.
             let (content, sources) = if request.prompt.contains("PLAN") {
                 ("alpha\nbeta".to_string(), vec![])
             } else {
@@ -1337,8 +1196,7 @@ step = "synth"
         assert!((fan.cost_usd - 0.2).abs() < 1e-9);
     }
 
-    // An agent that reports its real spend, like claude-code with
-    // --output-format=json.
+    // Reports real spend, like claude-code with --output-format=json.
     struct MockAgentWithCost;
 
     #[async_trait]
@@ -1352,8 +1210,7 @@ step = "synth"
         }
     }
 
-    // Records how many calls were ever in flight at once, so a test can prove that steps
-    // genuinely overlap instead of merely producing the right answer in the right order.
+    // Records peak in-flight calls, so a test can prove steps overlap rather than queue.
     struct ConcurrencyProbe {
         in_flight: std::sync::atomic::AtomicUsize,
         peak: std::sync::atomic::AtomicUsize,
@@ -1427,8 +1284,7 @@ step = "synth"
         assert!(result.output.contains("right branch"), "{}", result.output);
     }
 
-    // Reports the API-equivalent cost of work billed to a subscription, like claude-code
-    // with the API key hidden from it.
+    // Reports an API-equivalent cost, like claude-code with the API key hidden from it.
     struct MockSubscriptionAgent;
 
     #[async_trait]
@@ -1448,8 +1304,7 @@ step = "synth"
 
     #[tokio::test]
     async fn agent_fan_out_reconciles_to_reported_actual_cost() {
-        // Estimated $0.10/call, but the agent reports $0.07/call: the step
-        // and the budget should both settle on 2 × 0.07, not 2 × 0.10.
+        // Estimated $0.10/call but reported $0.07, so both should settle on 2 x 0.07.
         let wf = workflow("provider = \"claude-code\"\ncost_per_call_usd = 0.1");
         let engine = Engine::new(Arc::new(MockLlm), Arc::new(MockAgentWithCost));
         let mut budget = BudgetTracker::new(5.0);
@@ -1472,9 +1327,7 @@ step = "synth"
         assert!((budget.spent_usd - (0.14 + llm_cost)).abs() < 1e-9);
     }
 
-    // Fix #1: a completed output step is never discarded, even if its cost
-    // pushes spend past the cap. The money is already spent; throwing the
-    // result away would mean paying for a synthesis and getting a placeholder.
+    // Discarding it would mean paying for a synthesis and getting a placeholder.
     #[tokio::test]
     async fn output_step_is_kept_even_when_it_overshoots_budget() {
         let wf: WorkflowFile = toml::from_str(
@@ -1507,13 +1360,9 @@ step = "only"
         assert!(budget.spent_usd > budget.limit_usd);
     }
 
-    // Fix #2: a non-output step is skipped before it runs when its estimated
-    // cost would eat into the budget reserved for the output step. The
-    // synthesis still runs, on whatever partial results exist.
+    // A budget that fits synth but not plan-plus-synth: plan must give way.
     #[tokio::test]
     async fn expensive_step_is_skipped_to_preserve_budget_for_output() {
-        // `plan` carries a heavy web_search estimate; `synth` is cheap. With a
-        // budget that fits synth but not plan-plus-synth, plan must give way.
         let wf: WorkflowFile = toml::from_str(
             r#"
 [workflow]
@@ -1557,9 +1406,7 @@ step = "synth"
         assert!(budget.spent_usd > 0.0 && budget.spent_usd <= budget.limit_usd);
     }
 
-    // The bug this split fixes: under a subscription the CLI reports what the work would
-    // have cost on the API, and charging that to the ceiling aborts a run that costs
-    // nothing. Two items at $0.90 reported would blow a $1.00 cap outright.
+    // Two items reporting $0.90 each would blow a $1.00 cap that costs nothing to spend.
     #[tokio::test]
     async fn subscription_agent_spend_is_notional_and_never_trips_the_budget() {
         let wf = workflow("provider = \"claude-code\"\ncost_per_call_usd = 0.30");
@@ -1622,8 +1469,7 @@ step = "only"
         .expect("test workflow TOML should parse")
     }
 
-    // An all-agent workflow must run with no LlmProvider at all: that is what lets
-    // `flux run` work when ANTHROPIC_API_KEY is unset and billing goes through the CLI login.
+    // What lets `flux run` work with ANTHROPIC_API_KEY unset and billing via the CLI login.
     #[tokio::test]
     async fn agents_only_engine_runs_without_an_llm_client() {
         let wf = agent_only_workflow("provider = \"claude-code\"\ncost_per_call_usd = 0.01");

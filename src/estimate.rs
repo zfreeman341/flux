@@ -14,10 +14,7 @@ const CHARS_PER_TOKEN: f64 = 4.0;
 const ASSUMED_INPUT_REF_TOKENS: u32 = 2_000;
 // Typical response length for a research/synthesis step.
 const ASSUMED_OUTPUT_TOKENS: u32 = 2_000;
-// Input tokens a single web_search result adds to the conversation. Calibrated
-// against real runs (~3,500 tokens/result reproduced two web-grounded steps
-// within ~3%). This is per result; the compounding from re-sending it across
-// the tool-use loop is modeled separately in estimate_llm_step.
+// Per result, calibrated against real runs to within ~3%; compounding is applied below.
 const ASSUMED_TOKENS_PER_SEARCH: u32 = 3_500;
 // Must match the engine's default when a step omits max_tool_calls.
 const DEFAULT_MAX_TOOL_CALLS: u32 = 5;
@@ -46,9 +43,7 @@ pub fn estimate_workflow(wf: &WorkflowFile) -> WorkflowEstimate {
 }
 
 fn estimate_step(step: &Step) -> StepEstimate {
-    // Mirrors the engine's dispatch: agent providers fan out as subprocesses
-    // priced per call; everything else is direct API calls priced by tokens —
-    // including parallel steps, which fan out one API call per item.
+    // Mirrors the engine's dispatch: agents priced per call, everything else by tokens.
     let is_parallel = step.parallel_over.is_some() || !step.parallel_items.is_empty();
 
     if step.is_agent() {
@@ -60,8 +55,7 @@ fn estimate_step(step: &Step) -> StepEstimate {
     }
 }
 
-// Resolves how many items a parallel step will fan out over, recording an
-// assumption whenever the answer is a guess rather than a known count.
+/// Records an assumption whenever the item count is a guess rather than a known number.
 fn resolve_fan_out_count(step: &Step, assumptions: &mut Vec<String>) -> usize {
     if !step.parallel_items.is_empty() {
         step.parallel_items.len()
@@ -79,8 +73,7 @@ fn resolve_fan_out_count(step: &Step, assumptions: &mut Vec<String>) -> usize {
 fn estimate_parallel_llm_step(step: &Step) -> StepEstimate {
     let mut assumptions = Vec::new();
     let count = resolve_fan_out_count(step, &mut assumptions);
-    // Each item is an independent API call with the same prompt shape;
-    // estimate one and multiply.
+    // Every item has the same prompt shape, so estimate one and multiply.
     let per_item = estimate_llm_step(step);
     assumptions.push(format!("~${:.2} per item × {count}", per_item.cost_usd));
     assumptions.extend(per_item.assumptions);
@@ -123,8 +116,7 @@ fn estimate_llm_step(step: &Step) -> StepEstimate {
 
     let prompt_tokens = (step.prompt.chars().count() as f64 / CHARS_PER_TOKEN) as u32;
 
-    // Every upstream dependency and state file is a template variable whose
-    // size is unknown until run time — charge a flat stand-in for each.
+    // Each upstream output and state file has unknown size until run time.
     let input_refs = (step.depends_on.len() + step.reads_from.len()) as u32;
     if input_refs > 0 {
         assumptions.push(format!(
@@ -132,8 +124,7 @@ fn estimate_llm_step(step: &Step) -> StepEstimate {
         ));
     }
 
-    // Static context re-sent on every model call: the prompt plus any upstream
-    // outputs or state files injected as template variables.
+    // Re-sent on every model call in a tool loop, so it is charged per turn below.
     let static_context = prompt_tokens + input_refs * ASSUMED_INPUT_REF_TOKENS;
     let mut input_tokens = static_context;
     let mut search_surcharge = 0.0;
@@ -142,11 +133,7 @@ fn estimate_llm_step(step: &Step) -> StepEstimate {
         let searches = step.max_tool_calls.unwrap_or(DEFAULT_MAX_TOOL_CALLS);
         search_surcharge = searches as f64 * WEB_SEARCH_COST_PER_CALL_USD;
 
-        // A web_search step runs a tool-use loop: searches + 1 model calls, and
-        // the conversation grows each turn. The static context is re-sent on
-        // every call, and each search result is re-sent on every later call —
-        // so result tokens compound as the triangular number S(S+1)/2, not S.
-        // This compounding is why a flat per-search estimate ran ~5x low.
+        // Results are re-sent each later turn, so they compound as S(S+1)/2, not S.
         let turns = searches + 1;
         let compounded_results = ASSUMED_TOKENS_PER_SEARCH * searches * (searches + 1) / 2;
         input_tokens = static_context * turns + compounded_results;
@@ -224,8 +211,7 @@ mod tests {
 
     #[test]
     fn parallel_step_without_agent_provider_estimates_as_api_fan_out() {
-        // No provider: this now fans out as direct API calls, so the estimate
-        // is per-item token cost × count, not cost_per_call_usd × count.
+        // No provider means per-item token cost x count, not cost_per_call_usd x count.
         let parallel = step(
             "id = \"fan\"\nprompt = \"research {{ item }}\"\n\
              parallel_over = \"plan\"\ndepends_on = [\"plan\"]\nmax_items = 4\n\
@@ -247,8 +233,7 @@ mod tests {
         let searching = estimate_step(&step(
             "id = \"a\"\nprompt = \"find papers\"\ntools = [\"web_search\"]\nmax_tool_calls = 10",
         ));
-        // 10 searches at $0.01 plus their result tokens — strictly more than
-        // the surcharge alone.
+        // Result tokens make this strictly more than the per-search surcharge alone.
         assert!(searching.cost_usd - plain.cost_usd > 10.0 * WEB_SEARCH_COST_PER_CALL_USD);
         assert!(
             searching
@@ -260,10 +245,7 @@ mod tests {
 
     #[test]
     fn web_search_input_compounds_across_the_tool_loop() {
-        // Each search result is re-sent on every later turn, so input grows as
-        // the triangular number S(S+1)/2 — doubling the search count more than
-        // doubles the cost. A flat per-search model (the old bug) would have
-        // made these scale linearly.
+        // Superlinear by S(S+1)/2, so a flat per-search model would fail this.
         let two = estimate_step(&step(
             "id = \"a\"\nprompt = \"research it\"\ntools = [\"web_search\"]\nmax_tool_calls = 2",
         ));
@@ -280,9 +262,7 @@ mod tests {
 
     #[test]
     fn web_search_step_lands_in_the_calibrated_band() {
-        // A 4-search research step mirroring the resort/villa fan-out. Real runs
-        // put this near $0.20/item; the old flat model put it near $0.09. Guard
-        // against regressing back to the optimistic estimate.
+        // Real runs put a 4-search research step near $0.20/item, not the old $0.09.
         let est = estimate_step(&step(
             "id = \"r\"\nprompt = \"Research this stay; cover layout, rates, vibe, food, \
              location, and booking reality.\"\ndepends_on = [\"scout\"]\n\

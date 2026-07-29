@@ -39,15 +39,12 @@ async fn run(args: flux::cli::RunArgs) -> Result<()> {
     flux::validator::validate_workflow(&wf).context("workflow validation failed")?;
 
     let inputs = build_inputs(&args)?;
-    // Fail on missing inputs before any client exists: no API key needed,
-    // nothing spent. Lenient templates would otherwise render them empty
-    // and burn the budget on a garbage prompt.
+    // Lenient templates would otherwise spend the budget on a prompt full of blanks.
     flux::validator::check_required_inputs(&wf, &inputs)?;
 
     // Default agent provider is claude-code; switch to hermes if you have it installed.
     let agent = Arc::new(flux::agent::CliAgentProvider::claude_code());
-    // Build the API client only if some step actually needs it, so an all-agent
-    // workflow runs on the CLI's own login with no ANTHROPIC_API_KEY present.
+    // Skipped entirely for an all-agent workflow, which needs no ANTHROPIC_API_KEY.
     let engine = if wf.steps.iter().all(|s| s.is_agent()) {
         flux::engine::Engine::agents_only(agent)
     } else {
@@ -107,8 +104,7 @@ fn build_inputs(args: &flux::cli::RunArgs) -> Result<HashMap<String, String>> {
 
     for kf in &args.input_files {
         let (key, raw_path) = split_key_value(kf);
-        // Expand leading '~' to the home directory so callers can write
-        // --input-file notes=~/.flux-private/data/notes.md naturally.
+        // So callers can write --input-file notes=~/notes.md and have it resolve.
         let expanded = flux::expand_tilde(&raw_path);
         let content = std::fs::read_to_string(&expanded)
             .with_context(|| format!("failed to read input file '{}'", expanded))?;
@@ -231,8 +227,7 @@ fn write_run_artifacts(
     Ok(output_path)
 }
 
-// Subscription-billed spend is reported alongside real spend but labelled, so an artifact
-// read months later can't be mistaken for a bill.
+// Labelled so an artifact read months later cannot be mistaken for a bill.
 fn notional_note(notional_usd: f64) -> String {
     if notional_usd > 0.0 {
         format!(" (+ ${notional_usd:.4} notional, billed to the agent CLI's own plan)")
@@ -241,9 +236,7 @@ fn notional_note(notional_usd: f64) -> String {
     }
 }
 
-// Converts a string to a filename-safe slug: lowercase, runs of
-// non-alphanumeric chars collapsed to a single hyphen, leading/trailing
-// hyphens stripped.
+/// Lowercases, collapses non-alphanumeric runs to one hyphen, and trims hyphens.
 fn slugify(s: &str) -> String {
     let mut slug = String::with_capacity(s.len());
     let mut last_was_hyphen = true; // start true to strip leading hyphens

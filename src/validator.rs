@@ -13,8 +13,7 @@ pub fn validate_workflow(wf: &WorkflowFile) -> crate::Result<()> {
     Ok(())
 }
 
-// The output step is only consulted after every step has run — without this
-// check, a typo here is discovered after the entire budget is spent.
+// Checked up front because a typo here would otherwise surface after the budget is spent.
 fn check_output_step(wf: &WorkflowFile) -> crate::Result<()> {
     if !wf.steps.iter().any(|s| s.id == wf.output.step) {
         return Err(FluxError::Config(format!(
@@ -182,8 +181,7 @@ mod tests {
         toml::from_str(src).expect("test workflow TOML should parse")
     }
 
-    // Asserts validation fails and the error message names the problem,
-    // so a future refactor can't silently swap which check fired.
+    // Asserts on the message too, so a refactor cannot silently swap which check fired.
     fn assert_rejects(src: &str, expected_in_message: &str) {
         let err = validate_workflow(&wf(src)).unwrap_err();
         let msg = err.to_string();

@@ -17,9 +17,7 @@ const ANTHROPIC_VERSION: &str = "2023-06-01";
 const DEFAULT_MAX_TOKENS: u32 = 8096;
 const MAX_RETRIES: u32 = 6;
 const MAX_RETRY_DELAY_SECS: u64 = 90;
-// pause_turn means the server-side tool loop hit its iteration limit and
-// wants the conversation re-sent to resume where it left off. Cap how many
-// times we oblige so a pathological step can't loop forever.
+// Bounds how often a paused tool turn may be resumed, so a step cannot loop forever.
 const MAX_CONTINUATIONS: u32 = 3;
 
 pub struct AnthropicClient {
@@ -58,9 +56,7 @@ impl LlmProvider for AnthropicClient {
             info!(model = %request.model, tools = %tool_names, "→ calling API (web search may take 20-40s)");
         }
 
-        // The conversation only grows when the server pauses a tool turn:
-        // we echo the assistant's content back verbatim and re-send, and the
-        // API resumes its server-side tool loop where it stopped.
+        // The conversation only grows when the server pauses a tool turn.
         let mut messages = vec![json!({"role": "user", "content": request.prompt})];
         let mut content = String::new();
         let mut sources: Vec<String> = Vec::new();
@@ -98,8 +94,7 @@ impl LlmProvider for AnthropicClient {
                 content.push_str(&text);
             }
 
-            // Dedupe across continuation rounds too; linear scan is fine for
-            // the handful of sources a step cites.
+            // Linear scan: a step cites a handful of sources, not thousands.
             for source in extract_sources(&response.content) {
                 if !sources.contains(&source) {
                     sources.push(source);
@@ -113,9 +108,7 @@ impl LlmProvider for AnthropicClient {
                         continuation = continuations,
                         "server paused tool turn; resuming"
                     );
-                    // Echo the content blocks back untouched — the API detects
-                    // the trailing server tool state and continues on its own.
-                    // No extra user message.
+                    // Echoed back untouched: the API reads the trailing tool state itself.
                     messages.push(json!({"role": "assistant", "content": response.content}));
                     continue;
                 }
@@ -151,8 +144,7 @@ impl LlmProvider for AnthropicClient {
     }
 }
 
-// Maps the tool names used in workflow TOML to the Anthropic API's server-tool type strings.
-// These are managed server-side by Anthropic — no client-side execution loop needed.
+// Maps workflow TOML tool names to the API's server-tool types, which Anthropic executes.
 fn make_tool_def(name: &str, max_uses: u32) -> Value {
     match name {
         "web_search" => json!({
@@ -192,8 +184,7 @@ async fn send_with_retries(
 
         let resp = match result {
             Ok(resp) => resp,
-            // Connect and timeout failures are usually transient, and mid-fan-out they
-            // would otherwise cost a whole research branch.
+            // Usually transient, and mid-fan-out would otherwise cost a whole branch.
             Err(e) if attempt < MAX_RETRIES && (e.is_connect() || e.is_timeout()) => {
                 let delay = backoff_delay(attempt, None);
                 warn!(attempt, delay_secs = delay, error = %e, "transport error, retrying");
@@ -206,8 +197,7 @@ async fn send_with_retries(
 
         let status = resp.status();
         if is_retryable(status) && attempt < MAX_RETRIES {
-            // The server's retry-after knows exactly when the window resets, so it wins
-            // over our own guess.
+            // Authoritative when present: the server knows when the window resets.
             let retry_after = resp
                 .headers()
                 .get("retry-after")
@@ -232,14 +222,12 @@ async fn send_with_retries(
     }
 }
 
-// 429 plus every 5xx, which covers Anthropic's 529 overloaded_error and the transient
-// 500/502/503 responses that a long fan-out reliably runs into.
+// Every 5xx, which is what covers Anthropic's 529 overloaded_error.
 fn is_retryable(status: StatusCode) -> bool {
     status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
 }
 
-// Exponential backoff, jittered to keep a concurrent fan-out from retrying in lockstep.
-// A server-supplied retry_after is used as-is: it is authoritative, not a guess.
+/// Exponential backoff, jittered so a concurrent fan-out does not retry in lockstep.
 fn backoff_delay(attempt: u32, retry_after_secs: Option<u64>) -> u64 {
     if let Some(secs) = retry_after_secs {
         return secs.min(MAX_RETRY_DELAY_SECS);
@@ -248,20 +236,18 @@ fn backoff_delay(attempt: u32, retry_after_secs: Option<u64>) -> u64 {
     base + pseudo_jitter_secs(base)
 }
 
-// Dependency-free jitter: clock nanoseconds are more than random enough to decorrelate
-// retries, and this avoids pulling in `rand` for one call site.
+// Clock nanoseconds decorrelate retries well enough to avoid a dependency on `rand`.
 fn pseudo_jitter_secs(base: u64) -> u64 {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| u64::from(d.subsec_nanos()))
         .unwrap_or(0);
-    // Up to half the base delay, so total stays within 1.5x and under the cap.
+    // Up to half the base delay, keeping the total within 1.5x and under the cap.
     let spread = (base / 2).max(1);
     (nanos % spread).min(MAX_RETRY_DELAY_SECS - base.min(MAX_RETRY_DELAY_SECS))
 }
 
-// Collects cited sources from web_search citations attached to text blocks,
-// formatted "Title — URL" and deduplicated by URL in first-seen order.
+/// Collects "Title — URL" citations from text blocks, deduplicated in first-seen order.
 // Citation fields don't count toward token usage, so keeping them is free.
 fn extract_sources(content: &Value) -> Vec<String> {
     let Some(blocks) = content.as_array() else {
@@ -287,8 +273,7 @@ fn extract_sources(content: &Value) -> Vec<String> {
     sources
 }
 
-// Concatenates the text blocks from a raw content array. Non-text blocks
-// (server_tool_use, web_search_tool_result, ...) are skipped.
+/// Concatenates text blocks, skipping tool-use and tool-result blocks.
 fn extract_text(content: &Value) -> String {
     let Some(blocks) = content.as_array() else {
         return String::new();
@@ -303,10 +288,7 @@ fn extract_text(content: &Value) -> String {
 
 #[derive(Deserialize)]
 struct ApiResponse {
-    // Raw JSON rather than typed structs: a pause_turn continuation must echo
-    // the content back byte-faithfully, including block types we don't model
-    // (server_tool_use, web_search_tool_result, ...). Same typed-vs-dynamic
-    // tradeoff as parse_agent_output in agent.rs.
+    // Untyped because a pause_turn continuation must echo back blocks we do not model.
     content: Value,
     usage: Usage,
     stop_reason: Option<String>,
@@ -316,9 +298,7 @@ struct ApiResponse {
 struct Usage {
     input_tokens: u32,
     output_tokens: u32,
-    // Only present when server tools (web_search, web_fetch) ran during the
-    // request. Option + #[serde(default)] keeps deserialization tolerant:
-    // a missing field becomes None instead of an error.
+    // Absent unless a server tool ran, so it must deserialize as None rather than error.
     #[serde(default)]
     server_tool_use: Option<ServerToolUse>,
 }
@@ -393,8 +373,7 @@ mod tests {
 
     #[test]
     fn backoff_grows_and_stays_within_the_cap() {
-        // Jitter makes this a band rather than an exact value: base 2^attempt, plus up
-        // to half of it again.
+        // Jitter makes this a band, not an exact value: 2^attempt plus up to half again.
         for attempt in 0..MAX_RETRIES {
             let base = 2u64.pow(attempt).min(MAX_RETRY_DELAY_SECS);
             let delay = backoff_delay(attempt, None);

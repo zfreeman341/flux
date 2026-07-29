@@ -21,10 +21,7 @@ pub fn render_prompt(
     }
 
     let mut env = Environment::new();
-    // Lenient mode: undefined variables render as empty string instead of erroring.
-    // This prevents a missing reads_from file or a first-run empty state variable
-    // from aborting the entire workflow. Typos in variable names produce silent
-    // empty output rather than a crash — catch them by inspecting step output.
+    // Lenient so a first-run empty state file cannot abort a workflow; typos render empty.
     env.set_undefined_behavior(minijinja::UndefinedBehavior::Lenient);
     env.render_str(template, Value::Object(ctx))
         .map_err(|e| crate::FluxError::Template(e.to_string()))

@@ -31,8 +31,7 @@ fn list_models_shows_all_models() {
 
 #[test]
 fn run_rejects_missing_required_input() {
-    // paper-compare declares a `topic` input; running without it must fail
-    // before any API client is built (no API key in this test environment).
+    // Must fail before any API client is built: this environment has no API key.
     flux()
         .env_remove("ANTHROPIC_API_KEY")
         .args(["run", "examples/paper-compare.toml"])

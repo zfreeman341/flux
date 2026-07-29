@@ -16,12 +16,9 @@ pub const WEB_SEARCH_COST_PER_CALL_USD: f64 = 0.01;
 pub struct BudgetTracker {
     pub limit_usd: f64,
     pub spent_usd: f64,
-    /// Subscription-billed spend, reported for visibility but never enforced against the
-    /// limit. Kept separate from spent_usd so a run that costs nothing can't be aborted by
-    /// the API-equivalent figures an agent CLI reports.
+    /// Subscription-billed spend, reported for visibility but never enforced.
     pub notional_usd: f64,
-    // When true, add() accumulates cost but never errors. Enabled after a step
-    // is skipped due to budget so the output step can still synthesize partial results.
+    // While set, add() accumulates cost but never errors.
     emergency: bool,
 }
 
@@ -51,23 +48,16 @@ impl BudgetTracker {
         Ok(())
     }
 
-    // Called when a step is skipped due to BudgetExceeded so subsequent steps
-    // (specifically the output/synthesizer step) can still run.
+    /// Lifts the cap so the output step can still synthesize after a step was skipped.
     pub fn enable_emergency(&mut self) {
         self.emergency = true;
     }
 
-    // True once a step has been budget-killed and we've committed to spending
-    // past the cap to finish. The pre-flight reservation guard stands down in
-    // this mode: budget enforcement is already off, so there's nothing left to
-    // protect.
     pub fn in_emergency(&self) -> bool {
         self.emergency
     }
 
-    // Rolls back a phantom pre-charge. Used when a parallel step pre-charges
-    // for N agent calls but gets budget-killed before any agent actually runs —
-    // the reported spend should reflect real API calls, not a failed estimate.
+    /// Rolls back a pre-charge for calls that never happened.
     pub fn refund(&mut self, amount: f64) {
         self.spent_usd -= amount;
     }
@@ -123,8 +113,7 @@ pub fn model_pricing(model: &str) -> (f64, f64) {
 mod tests {
     use super::*;
 
-    // Direct float equality is fine here: the inputs are chosen so the
-    // arithmetic is exact in f64 (powers of ten, no accumulated error).
+    // Direct float equality is safe: these inputs are exact in f64.
     const EPS: f64 = 1e-9;
 
     #[test]
@@ -146,8 +135,7 @@ mod tests {
         let mut budget = BudgetTracker::new(1.0);
         let err = budget.add(1.5).unwrap_err();
         assert!(matches!(err, FluxError::BudgetExceeded { .. }));
-        // The cost is recorded even when the limit trips — callers refund
-        // explicitly when no real spend happened (parallel pre-charge).
+        // Recorded even when the limit trips; callers refund if no real spend happened.
         assert!((budget.spent_usd - 1.5).abs() < EPS);
     }
 
