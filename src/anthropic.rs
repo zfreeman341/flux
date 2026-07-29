@@ -182,36 +182,45 @@ async fn send_with_retries(
 ) -> crate::Result<ApiResponse> {
     let mut attempt = 0u32;
     loop {
-        let resp = client
+        let result = client
             .post(API_URL)
             .header("x-api-key", api_key)
             .header("anthropic-version", ANTHROPIC_VERSION)
             .json(body)
             .send()
-            .await
-            .map_err(|e| FluxError::Api(e.to_string()))?;
+            .await;
 
-        if resp.status() == StatusCode::TOO_MANY_REQUESTS && attempt < MAX_RETRIES {
-            // Prefer the server's retry-after over our own backoff — it knows
-            // exactly when the rate limit window resets.
+        let resp = match result {
+            Ok(resp) => resp,
+            // Connect and timeout failures are usually transient, and mid-fan-out they
+            // would otherwise cost a whole research branch.
+            Err(e) if attempt < MAX_RETRIES && (e.is_connect() || e.is_timeout()) => {
+                let delay = backoff_delay(attempt, None);
+                warn!(attempt, delay_secs = delay, error = %e, "transport error, retrying");
+                sleep(Duration::from_secs(delay)).await;
+                attempt += 1;
+                continue;
+            }
+            Err(e) => return Err(FluxError::Api(e.to_string())),
+        };
+
+        let status = resp.status();
+        if is_retryable(status) && attempt < MAX_RETRIES {
+            // The server's retry-after knows exactly when the window resets, so it wins
+            // over our own guess.
             let retry_after = resp
                 .headers()
                 .get("retry-after")
                 .and_then(|v| v.to_str().ok())
                 .and_then(|s| s.parse::<u64>().ok());
-
-            let delay_secs = retry_after
-                .unwrap_or_else(|| 2u64.pow(attempt))
-                .min(MAX_RETRY_DELAY_SECS);
-
-            warn!(attempt, delay_secs, "rate limited, retrying");
-            sleep(Duration::from_secs(delay_secs)).await;
+            let delay = backoff_delay(attempt, retry_after);
+            warn!(attempt, %status, delay_secs = delay, "retryable response, retrying");
+            sleep(Duration::from_secs(delay)).await;
             attempt += 1;
             continue;
         }
 
-        if !resp.status().is_success() {
-            let status = resp.status();
+        if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
             return Err(FluxError::Api(format!("{status}: {text}")));
         }
@@ -221,6 +230,34 @@ async fn send_with_retries(
             .await
             .map_err(|e| FluxError::Api(format!("failed to parse API response: {e}")));
     }
+}
+
+// 429 plus every 5xx, which covers Anthropic's 529 overloaded_error and the transient
+// 500/502/503 responses that a long fan-out reliably runs into.
+fn is_retryable(status: StatusCode) -> bool {
+    status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+}
+
+// Exponential backoff, jittered to keep a concurrent fan-out from retrying in lockstep.
+// A server-supplied retry_after is used as-is: it is authoritative, not a guess.
+fn backoff_delay(attempt: u32, retry_after_secs: Option<u64>) -> u64 {
+    if let Some(secs) = retry_after_secs {
+        return secs.min(MAX_RETRY_DELAY_SECS);
+    }
+    let base = 2u64.saturating_pow(attempt).min(MAX_RETRY_DELAY_SECS);
+    base + pseudo_jitter_secs(base)
+}
+
+// Dependency-free jitter: clock nanoseconds are more than random enough to decorrelate
+// retries, and this avoids pulling in `rand` for one call site.
+fn pseudo_jitter_secs(base: u64) -> u64 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::from(d.subsec_nanos()))
+        .unwrap_or(0);
+    // Up to half the base delay, so total stays within 1.5x and under the cap.
+    let spread = (base / 2).max(1);
+    (nanos % spread).min(MAX_RETRY_DELAY_SECS - base.min(MAX_RETRY_DELAY_SECS))
 }
 
 // Collects cited sources from web_search citations attached to text blocks,
@@ -333,6 +370,40 @@ mod tests {
             extract_sources(&content),
             vec!["One — https://x.com/1", "Two — https://x.com/2"]
         );
+    }
+
+    #[test]
+    fn retryable_covers_rate_limit_and_all_server_errors() {
+        assert!(is_retryable(StatusCode::TOO_MANY_REQUESTS));
+        // 529 overloaded_error is Anthropic-specific and has no StatusCode constant.
+        assert!(is_retryable(StatusCode::from_u16(529).unwrap()));
+        assert!(is_retryable(StatusCode::INTERNAL_SERVER_ERROR));
+        assert!(is_retryable(StatusCode::SERVICE_UNAVAILABLE));
+        // Client errors are the caller's fault; retrying just wastes the budget.
+        assert!(!is_retryable(StatusCode::BAD_REQUEST));
+        assert!(!is_retryable(StatusCode::UNAUTHORIZED));
+        assert!(!is_retryable(StatusCode::OK));
+    }
+
+    #[test]
+    fn backoff_prefers_retry_after_and_caps_it() {
+        assert_eq!(backoff_delay(0, Some(12)), 12);
+        assert_eq!(backoff_delay(5, Some(9_999)), MAX_RETRY_DELAY_SECS);
+    }
+
+    #[test]
+    fn backoff_grows_and_stays_within_the_cap() {
+        // Jitter makes this a band rather than an exact value: base 2^attempt, plus up
+        // to half of it again.
+        for attempt in 0..MAX_RETRIES {
+            let base = 2u64.pow(attempt).min(MAX_RETRY_DELAY_SECS);
+            let delay = backoff_delay(attempt, None);
+            assert!(delay >= base, "attempt {attempt}: {delay} < {base}");
+            assert!(
+                delay <= MAX_RETRY_DELAY_SECS,
+                "attempt {attempt}: {delay} exceeds cap"
+            );
+        }
     }
 
     #[test]
