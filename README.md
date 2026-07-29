@@ -4,8 +4,9 @@ A Rust CLI that runs multi-agent LLM research workflows defined in TOML.
 
 Workflows describe a DAG of steps. Each step is an LLM call — with a prompt,
 a model, optional web tools, and dependencies on earlier steps. flux executes
-the DAG: sequential where steps depend on each other, parallel fan-out where
-they don't, with a hard budget cap in dollars enforced at every step.
+the DAG in dependency waves: steps that share no dependency edge run
+concurrently, fan-out steps spread one call per item, and a hard budget cap in
+dollars is enforced at every step.
 
 The premise: you get better answers to research questions by decomposing them,
 investigating the parts in parallel, and synthesizing the results — than you
@@ -39,7 +40,8 @@ Estimated total: ~$0.64 of $2.00 budget
 # Build (Rust 1.85+, edition 2024)
 cargo build --release
 
-# flux talks to the Anthropic API directly
+# Direct API steps need a key. Workflows built entirely from agent steps
+# (provider = "claude-code") need no key at all — see Billing below.
 export ANTHROPIC_API_KEY=sk-ant-...
 
 # Always look before you spend: validate, then estimate
@@ -55,6 +57,23 @@ flux run examples/resort-scout.toml --input "two adults, beachfront, great food,
 
 The final output lands in `outputs/`, and full per-step debug artifacts
 (prompts, outputs, token counts, cost, timing) in `.flux-runs/<timestamp>/`.
+
+### Billing: API credits or a Claude subscription
+
+Steps that set `provider = "claude-code"` run through the `claude` CLI and bill
+whatever that CLI is logged into — a Claude Pro/Max subscription, typically. To
+keep that promise honest, flux removes `ANTHROPIC_API_KEY` from the subprocess
+environment: the CLI silently prefers an inherited key over its stored login,
+which would quietly bill API credits for work the subscription already covers.
+
+A workflow whose every step is an agent step therefore needs no key at all, and
+flux never constructs an API client for one:
+
+```sh
+env -u ANTHROPIC_API_KEY flux run my-agent-workflow.toml
+```
+
+Mixed workflows work too — API steps use the key, agent steps don't see it.
 
 ## A workflow, annotated
 
@@ -119,12 +138,12 @@ namespaced (`{{ find.output }}`).
 | `tools` | Managed server tools: `web_search`, `web_fetch`. |
 | `max_tool_calls` | Cap on tool invocations per step (default 5). |
 | `max_tokens` | Output token budget per call (default 8096). Raise for long synthesis steps — hitting the cap is flagged with a visible `[NOTE: ...]` marker. |
-| `provider` | `anthropic` (default, direct API) or an agent CLI: `claude-code`, `hermes`. |
-| `parallel_over` | Fan out one call per line of the named upstream step's output. |
+| `provider` | `anthropic` (default, direct API) or an agent CLI: `claude-code`, `hermes`. Agent steps bill the CLI's own login, not your API key. |
+| `parallel_over` | Fan out one call per item from the named upstream step's output. If that output contains a fenced block, only the block is read as the item list — so a planner's prose can't become an item. |
 | `parallel_items` | Static fan-out list, when the items are known at authoring time. |
 | `max_items` | Cap the fan-out size (protects the budget from a chatty planner). |
 | `max_concurrent` | In-flight cap for fan-out calls (default 3), via a semaphore. |
-| `cost_per_call_usd` | Pre-charged estimate per agent call; reconciled to the actual cost the agent CLI reports. |
+| `cost_per_call_usd` | Pre-charged estimate per agent call; reconciled to the actual cost the agent CLI reports. Ignored for subscription-billed agents, which are never pre-charged. |
 | `timeout_secs` | Per-agent-call deadline (default 300). |
 | `reads_from` | Map of template variable → state file path, loaded before the step runs. |
 | `appends_to` | State file the step's output is appended to (timestamped) after it runs. |
@@ -150,6 +169,13 @@ namespaced (`{{ find.output }}`).
                     outputs/  +  .flux-runs/<ts>/
 ```
 
+**Scheduling is by dependency wave, not one step at a time.** Steps are grouped
+into waves — a wave being every step whose dependencies are already satisfied —
+and each wave runs concurrently. A DAG that opens with two independent steps
+takes as long as the slower one, not their sum. The shared budget sits behind a
+`tokio::sync::Mutex` so concurrent steps serialize only on the accounting, not
+on the network calls.
+
 **Two kinds of steps.** Direct API steps call Anthropic's Messages API
 (`LlmProvider` trait), with web research handled by Anthropic's managed
 server-side `web_search`/`web_fetch` tools. Agent steps (`AgentProvider`
@@ -167,6 +193,7 @@ engine — and make the whole engine testable against mock providers.
 | Latency | one API round-trip, server-side search | agent boots, plans, and crawls |
 | Best for | search-and-summarize per item | multi-hop crawling (follow links, check sub-pages) |
 | Cost accounting | exact token billing per call | actual cost reported by the claude CLI |
+| Billed to | your `ANTHROPIC_API_KEY` | the agent CLI's own login |
 
 The ~10× per-item price difference compounds: a cheaper fan-out means you can
 afford more items and more searches per item for the same budget — usually
@@ -181,10 +208,19 @@ If the budget trips, remaining steps are skipped — except the final
 synthesizer, which runs in an "emergency" mode so you get a partial result
 instead of nothing.
 
+**Metered and notional spend are tracked separately.** A subscription-billed
+agent still reports what its work *would* have cost on the API. Charging that
+figure to the cap would abort runs that cost nothing, so it accumulates as
+notional spend, reported for visibility and never enforced. The provider
+declares which kind it is (`Billing::Metered` or `Billing::Notional`); only
+metered spend is real money and only metered spend can trip the ceiling.
+
 **Partial failure is expected, not fatal.** A fan-out call that fails after
 retries is skipped; the synthesizer is told which items failed and writes
-around the gap. Rate limits (429) get exponential backoff that honors the
-server's `retry-after`.
+around the gap. Rate limits (429), overload responses (529), other 5xx, and
+transient connect/timeout failures all get exponential backoff — jittered, so
+a concurrent fan-out doesn't retry in lockstep — and a server-supplied
+`retry-after` overrides the computed delay.
 
 **Everything is observable — and verifiable.** Structured `tracing` logs per
 step (tokens, cost, duration), and every run writes `.flux-runs/<timestamp>/`
