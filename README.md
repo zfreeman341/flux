@@ -1,12 +1,13 @@
 # flux
 
+[![CI](https://github.com/zfreeman341/flux/actions/workflows/ci.yml/badge.svg)](https://github.com/zfreeman341/flux/actions/workflows/ci.yml)
+
 A Rust CLI that runs multi-agent LLM research workflows defined in TOML.
 
-Workflows describe a DAG of steps. Each step is an LLM call — with a prompt,
-a model, optional web tools, and dependencies on earlier steps. flux executes
-the DAG in dependency waves: steps that share no dependency edge run
-concurrently, fan-out steps spread one call per item, and a hard budget cap in
-dollars is enforced at every step.
+Workflows describe a DAG of LLM, HTTP, MCP, and local transform steps. flux
+executes the DAG in dependency waves: steps that share no dependency edge run
+concurrently, fan-out steps spread one call per item, and a hard model-spend
+budget is enforced at every step.
 
 The premise: you get better answers to research questions by decomposing them,
 investigating the parts in parallel, and synthesizing the results — than you
@@ -37,7 +38,7 @@ Estimated total: ~$0.64 of $2.00 budget
 ## Quickstart
 
 ```sh
-# Build (Rust 1.85+, edition 2024)
+# Build (Rust 1.88+, edition 2024)
 cargo build --release
 
 # Direct API steps need a key. Workflows built entirely from agent steps
@@ -127,24 +128,127 @@ namespaced (`{{ find.output }}`).
 | `flux explain <file>` | Show the execution plan with a per-step and total cost estimate. No API calls. |
 | `flux list-models` | The supported model shorthand. |
 
+## Step kinds
+
+Not every node in a research DAG should be a model call. A step declares its
+`kind`, defaulting to `agent` so existing workflows are unaffected.
+
+| Kind | What it does | Cost |
+|---|---|---|
+| `agent` | An LLM call: prompt, model, optional web tools. The original behavior. | Metered or notional |
+| `http` | A plain request. The response is passed downstream in the upstream API's own shape. | Free |
+| `mcp` | An explicit tool call to a named local stdio MCP server. | Free in Flux |
+| `transform` | A named pure function over records — dedupe, group, rank. | Free |
+
+Free steps are exempt from the budget reservation guard. That exemption is the
+point: an HTTP fan-out over 70 endpoints draws nothing, and gating it on
+remaining headroom would skip cheap deterministic work for no saving.
+
+### MCP steps
+
+MCP servers are declared once and referenced by name. Flux starts one child
+process per MCP step, performs the protocol handshake, verifies the tool exists,
+reuses that session across fan-out calls, and closes it when the step completes.
+
+```toml
+[mcp.servers.github]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-github"]
+pass_env = ["GITHUB_TOKEN"]
+
+[[steps]]
+id = "issues"
+kind = "mcp"
+server = "github"
+tool = "list_issues"
+arguments = { owner = "{{ owner }}", repo = "{{ repo }}", state = "open" }
+timeout_secs = 60
+```
+
+`arguments` is a typed TOML object: strings are minijinja templates, while
+numbers, booleans, arrays, and nested objects retain their JSON types. Each
+result is a validated `mcp_response` record with `server`, `tool`, `item`,
+`is_error`, and `result` fields. Fan-out call failures become error records so
+surviving calls continue; spawn, handshake, and missing-tool failures stop the
+step before calls begin.
+
+MCP steps are deterministic in orchestration—Flux selects the server and tool
+rather than asking a model to choose—not necessarily pure. A tool can mutate
+external state or incur its own service charges, neither of which is represented
+by Flux's model budget. Workflow files can execute local programs; review them
+before running. Child environments contain only `HOME`, `PATH`, `TMPDIR`, and
+variables explicitly named by `pass_env`, and secret values are never logged.
+Only local stdio servers are supported; remote transports and model-directed MCP
+tool selection remain future work.
+
+### Typed artifacts
+
+Steps used to pass prose. A step that fetches JSON produces records instead, so
+a DAG edge carries an `Artifact`:
+
+```rust
+enum Artifact {
+    Text    { body: String, sources: Vec<Source> },
+    Records { schema: Schema, rows: Vec<Value> },
+}
+```
+
+`Records` carries the schema its rows satisfy, and rows are revalidated at every
+step boundary against it. A row that fails is dropped
+and logged, and the run continues — the same graceful degradation already used
+for budget exhaustion. In templates, `{{ step.output }}` is the prose form (records
+render as pretty JSON, so a model can read them), while `{{ step.rows }}` and
+`{{ step.count }}` expose the records directly.
+
+Fan-out generalizes to records: `parallel_over` a `Records` step runs one branch
+per row, and the prompt or URL template can reach into it with `{{ item.field }}`.
+
+### Extending flux
+
+Schemas, transforms, and probes are looked up by name in a `Registry`. flux
+registers a small generic set; a crate built on flux adds its own before
+constructing the engine, so domain-specific steps live outside this repo:
+
+```rust
+let mut registry = Registry::builtin();
+registry.register_schema(Schema::of::<Invoice>("invoice"));
+registry.register_transform("overdue", |inputs: &[&Artifact], _: &TransformArgs| {
+    all_rows(inputs).into_iter().filter(is_overdue).collect()
+});
+
+let outcome = flux::runner::run(&args, Arc::new(registry)).await?;
+```
+
+An unknown `output_type`, `transform`, or `probe` name is rejected by
+`flux validate`, before anything is spent. Built in: the `record`,
+`http_response`, and `mcp_response` schemas, and the `dedupe`, `difference`,
+`top_n`, and `group_by` transforms.
+
 ## Step reference
 
 | Field | Meaning |
 |---|---|
 | `id` | Unique step name; other steps reference it in `depends_on` and templates. |
+| `kind` | `agent` (default), `http`, `mcp`, or `transform`. |
+| `url` / `method` / `body` / `headers` | Request definition for `kind = "http"`. `url` and `body` are templates. |
+| `probe` | A registered multi-request routine for `kind = "http"`, for lookups that are not one request per item. None are built in. |
+| `server` / `tool` / `arguments` | Named server, exact tool, and typed templated argument object for `kind = "mcp"`. |
+| `transform` | Which registered pure function to apply for `kind = "transform"`. |
+| `args` | Keyword lists the transform reads, so filter policy lives in the workflow rather than in compiled code. |
+| `output_type` | Name of the schema this step's rows are validated against (`record` for any JSON object). Also promotes an agent step's JSON reply to `Records`. |
 | `model` | Anthropic model id (default `claude-sonnet-4-6`). |
 | `prompt` | minijinja template for the step's prompt. |
 | `depends_on` | Steps that must finish first; their outputs become template variables. |
 | `tools` | Managed server tools: `web_search`, `web_fetch`. |
 | `max_tool_calls` | Cap on tool invocations per step (default 5). |
 | `max_tokens` | Output token budget per call (default 8096). Raise for long synthesis steps — hitting the cap is flagged with a visible `[NOTE: ...]` marker. |
-| `provider` | `anthropic` (default, direct API) or an agent CLI: `claude-code`, `hermes`. Agent steps bill the CLI's own login, not your API key. |
+| `provider` | `anthropic` (default, direct API) or an agent CLI: `claude-code`, `cursor`, `hermes`. Agent steps bill the CLI's own login, not your API key. |
 | `parallel_over` | Fan out one call per item from the named upstream step's output. If that output contains a fenced block, only the block is read as the item list — so a planner's prose can't become an item. |
 | `parallel_items` | Static fan-out list, when the items are known at authoring time. |
 | `max_items` | Cap the fan-out size (protects the budget from a chatty planner). |
 | `max_concurrent` | In-flight cap for fan-out calls (default 3), via a semaphore. |
 | `cost_per_call_usd` | Pre-charged estimate per agent call; reconciled to the actual cost the agent CLI reports. Ignored for subscription-billed agents, which are never pre-charged. |
-| `timeout_secs` | Per-agent-call deadline (default 300). |
+| `timeout_secs` | Per-call deadline: agent default 300 seconds, MCP default 60 seconds. |
 | `reads_from` | Map of template variable → state file path, loaded before the step runs. |
 | `appends_to` | State file the step's output is appended to (timestamped) after it runs. |
 
@@ -176,13 +280,12 @@ takes as long as the slower one, not their sum. The shared budget sits behind a
 `tokio::sync::Mutex` so concurrent steps serialize only on the accounting, not
 on the network calls.
 
-**Two kinds of steps.** Direct API steps call Anthropic's Messages API
+**Multiple execution backends.** Direct API steps call Anthropic's Messages API
 (`LlmProvider` trait), with web research handled by Anthropic's managed
-server-side `web_search`/`web_fetch` tools. Agent steps (`AgentProvider`
-trait) shell out to an agent CLI (`claude -p ...`) for tasks that benefit
-from a full tool-using agent — e.g. crawling a site's structure rather than
-issuing one search. The traits keep providers swappable without touching the
-engine — and make the whole engine testable against mock providers.
+server-side `web_search`/`web_fetch` tools. Agent steps (`AgentProvider` trait)
+shell out to an agent CLI for tasks that benefit from a full tool-using agent.
+HTTP, MCP, and transform executors handle explicitly selected deterministic
+operations without involving a model.
 
 **Choosing a fan-out type.** Both kinds can fan out in parallel; the
 `provider` field on the fan-out step picks which:

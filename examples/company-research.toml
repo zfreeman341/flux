@@ -49,7 +49,7 @@ depends_on = ["researcher"]
 # appends_to writes this step's output to a file after it succeeds.
 # The file is created if it doesn't exist; each run appends with a timestamp header.
 # Uncomment and set a path to accumulate research across runs:
-# appends_to = "~/.flux-private/data/company-notes.md"
+# appends_to = "~/research/company-notes.md"
 prompt = """
 Here are research summaries for each company:
 
