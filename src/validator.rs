@@ -1,15 +1,96 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::{FluxError, workflow::WorkflowFile};
+use crate::{FluxError, registry::Registry, workflow::WorkflowFile};
 
+/// Static checks against the built-in registry. Use [`validate_workflow_with`]
+/// when extra schemas, transforms, or probes are registered.
 pub fn validate_workflow(wf: &WorkflowFile) -> crate::Result<()> {
+    validate_workflow_with(wf, &Registry::builtin())
+}
+
+pub fn validate_workflow_with(wf: &WorkflowFile, registry: &Registry) -> crate::Result<()> {
     check_budget(wf)?;
+    check_mcp_servers(wf)?;
     check_unique_ids(wf)?;
     check_depends_on_refs(wf)?;
     check_no_cycles(wf)?;
     check_providers(wf)?;
     check_parallel_over(wf)?;
     check_output_step(wf)?;
+    check_step_kinds(wf, registry)?;
+    Ok(())
+}
+
+/// Runs each step's kind-specific checks so a misconfigured HTTP or transform
+/// step is caught by `flux validate`, not halfway through a paid run.
+fn check_step_kinds(wf: &WorkflowFile, registry: &Registry) -> crate::Result<()> {
+    for step in &wf.steps {
+        let resolved = step.resolve(registry)?;
+        match resolved {
+            crate::workflow::StepKind::Mcp(mcp) => {
+                if !wf.mcp.servers.contains_key(mcp.server) {
+                    return Err(FluxError::Config(format!(
+                        "step '{}' references unknown MCP server '{}'",
+                        step.id, mcp.server
+                    )));
+                }
+                if !step.prompt.is_empty()
+                    || step.provider.is_some()
+                    || !step.tools.is_empty()
+                    || step.max_tool_calls.is_some()
+                    || step.url.is_some()
+                    || step.body.is_some()
+                    || step.probe.is_some()
+                    || step.transform.is_some()
+                    || !step.args.is_empty()
+                    || step.output_type.is_some()
+                {
+                    return Err(FluxError::Config(format!(
+                        "step '{}': kind = \"mcp\" contains fields for another step kind",
+                        step.id
+                    )));
+                }
+            }
+            crate::workflow::StepKind::Transform(_) => {
+                if step.depends_on.is_empty() {
+                    return Err(FluxError::Config(format!(
+                        "step '{}' is a transform but depends_on nothing, so it has no input",
+                        step.id
+                    )));
+                }
+            }
+            crate::workflow::StepKind::Agent(_) | crate::workflow::StepKind::Http(_) => {}
+        }
+    }
+    Ok(())
+}
+
+fn check_mcp_servers(wf: &WorkflowFile) -> crate::Result<()> {
+    for (name, server) in &wf.mcp.servers {
+        if name.trim().is_empty() {
+            return Err(FluxError::Config(
+                "MCP server names must not be empty".to_string(),
+            ));
+        }
+        if server.command.trim().is_empty() {
+            return Err(FluxError::Config(format!(
+                "MCP server '{name}' has an empty command"
+            )));
+        }
+        let mut seen = HashSet::new();
+        for variable in &server.pass_env {
+            if variable.is_empty() || variable.contains('=') || variable.contains('\0') {
+                return Err(FluxError::Config(format!(
+                    "MCP server '{name}' has invalid environment variable name '{variable}'"
+                )));
+            }
+            if !seen.insert(variable) {
+                return Err(FluxError::Config(format!(
+                    "MCP server '{name}' lists environment variable '{variable}' more than once"
+                )));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -87,7 +168,7 @@ fn check_depends_on_refs(wf: &WorkflowFile) -> crate::Result<()> {
     Ok(())
 }
 
-const VALID_PROVIDERS: &[&str] = &["anthropic", "hermes", "claude-code"];
+const VALID_PROVIDERS: &[&str] = &["anthropic", "hermes", "claude-code", "cursor"];
 
 fn check_providers(wf: &WorkflowFile) -> crate::Result<()> {
     for step in &wf.steps {
@@ -426,6 +507,72 @@ parallel_over = "plan"
 step = "fan"
 "#,
             "not listed in depends_on",
+        );
+    }
+
+    #[test]
+    fn accepts_mcp_step_with_declared_server() {
+        let workflow = wf(r#"
+[workflow]
+name = "mcp"
+[budget]
+max_usd = 1.0
+[mcp.servers.local]
+command = "mock-server"
+args = ["--stdio"]
+pass_env = ["TOKEN"]
+[[steps]]
+id = "call"
+kind = "mcp"
+server = "local"
+tool = "echo"
+arguments = { value = 42 }
+[output]
+step = "call"
+"#);
+        assert!(validate_workflow(&workflow).is_ok());
+    }
+
+    #[test]
+    fn rejects_unknown_mcp_server() {
+        assert_rejects(
+            r#"
+[workflow]
+name = "mcp"
+[budget]
+max_usd = 1.0
+[[steps]]
+id = "call"
+kind = "mcp"
+server = "missing"
+tool = "echo"
+[output]
+step = "call"
+"#,
+            "unknown MCP server",
+        );
+    }
+
+    #[test]
+    fn rejects_mcp_fields_from_other_step_kinds() {
+        assert_rejects(
+            r#"
+[workflow]
+name = "mcp"
+[budget]
+max_usd = 1.0
+[mcp.servers.local]
+command = "mock-server"
+[[steps]]
+id = "call"
+kind = "mcp"
+server = "local"
+tool = "echo"
+prompt = "not used"
+[output]
+step = "call"
+"#,
+            "fields for another step kind",
         );
     }
 }

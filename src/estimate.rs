@@ -44,7 +44,16 @@ pub fn estimate_workflow(wf: &WorkflowFile) -> WorkflowEstimate {
 
 fn estimate_step(step: &Step) -> StepEstimate {
     // Mirrors the engine's dispatch: agents priced per call, everything else by tokens.
-    let is_parallel = step.parallel_over.is_some() || !step.parallel_items.is_empty();
+    let is_parallel = step.fans_out();
+
+    // Deterministic steps cost nothing, however wide they fan out.
+    if step.is_free() {
+        return StepEstimate {
+            id: step.id.clone(),
+            cost_usd: 0.0,
+            assumptions: vec!["deterministic step — no model calls".to_string()],
+        };
+    }
 
     if step.is_agent() {
         estimate_agent_step(step, is_parallel)

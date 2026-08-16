@@ -29,6 +29,11 @@
 //! - [`cost`] / [`estimate`] — pricing, the budget tracker, and the cost
 //!   estimate surfaced by `flux explain`.
 //! - [`template`] — prompt rendering with cross-step variable substitution.
+//! - [`artifact`] / [`transform`] / [`registry`] — typed records passed between
+//!   steps, the pure functions over them, and the name lookup that lets another
+//!   crate add its own schemas, transforms, and probes.
+//! - [`runner`] — the `flux run` pipeline as a library call, so a binary built
+//!   on flux with a custom registry reuses it.
 //!
 //! ## Example
 //!
@@ -50,14 +55,20 @@
 
 pub mod agent;
 pub mod anthropic;
+pub mod artifact;
 pub mod cli;
 pub mod cost;
 pub mod engine;
 pub mod error;
 pub mod estimate;
+pub mod http;
+pub mod mcp;
 pub mod parser;
 pub mod provider;
+pub mod registry;
+pub mod runner;
 pub mod template;
+pub mod transform;
 pub mod validator;
 pub mod workflow;
 

@@ -179,3 +179,71 @@ step = "researcher"
         .failure()
         .stderr(contains("not listed in depends_on"));
 }
+
+fn write_mcp_workflow(dir: &std::path::Path) -> std::path::PathBuf {
+    let workflow = dir.join("mcp.toml");
+    let fixture =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mock_mcp_server.py");
+    std::fs::write(
+        &workflow,
+        format!(
+            r#"
+[workflow]
+name = "mcp-test"
+output_dir = "{}"
+[budget]
+max_usd = 1.0
+[mcp.servers.test]
+command = "python3"
+args = ["{}"]
+[[steps]]
+id = "echo"
+kind = "mcp"
+server = "test"
+tool = "echo"
+arguments = {{ message = "hello" }}
+[output]
+step = "echo"
+"#,
+            dir.join("outputs").display(),
+            fixture.display()
+        ),
+    )
+    .unwrap();
+    workflow
+}
+
+#[test]
+fn validate_and_explain_support_mcp_workflows() {
+    let temp = tempfile::tempdir().unwrap();
+    let workflow = write_mcp_workflow(temp.path());
+
+    flux()
+        .args(["validate", workflow.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(contains("is valid"));
+
+    flux()
+        .args(["explain", workflow.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(contains("Kind:     MCP"))
+        .stdout(contains("Server:   test"))
+        .stdout(contains("Tool:     echo"))
+        .stdout(contains("Est cost: ~$0.00"));
+}
+
+#[test]
+fn mcp_only_workflow_runs_without_anthropic_api_key() {
+    let temp = tempfile::tempdir().unwrap();
+    let workflow = write_mcp_workflow(temp.path());
+
+    flux()
+        .current_dir(temp.path())
+        .env_remove("ANTHROPIC_API_KEY")
+        .args(["run", workflow.to_str().unwrap()])
+        .assert()
+        .success()
+        .stderr(contains("spent $0.0000"));
+}

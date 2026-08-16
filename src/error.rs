@@ -28,6 +28,15 @@ pub enum FluxError {
 
     #[error("agent error: {0}")]
     Agent(String),
+
+    #[error("HTTP error: {0}")]
+    Http(String),
+
+    #[error("MCP error: {0}")]
+    Mcp(String),
+
+    #[error("JSON error: {0}")]
+    Json(#[from] serde_json::Error),
 }
 
 pub type Result<T> = std::result::Result<T, FluxError>;

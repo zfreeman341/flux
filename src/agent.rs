@@ -1,6 +1,8 @@
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use tokio::io::AsyncWriteExt;
 use tracing::{debug, instrument};
 
 use crate::{
@@ -14,6 +16,7 @@ pub struct CliAgentProvider {
     // Inserted between the binary and the task: ["-p"] for claude, ["-z"] for hermes.
     args: Vec<String>,
     scrub_api_key: bool,
+    task_via_stdin: bool,
 }
 
 impl CliAgentProvider {
@@ -22,12 +25,22 @@ impl CliAgentProvider {
             binary: binary.into(),
             args,
             scrub_api_key: false,
+            task_via_stdin: false,
         }
     }
 
     /// Hides ANTHROPIC_API_KEY so the CLI uses its own login instead of metered credits.
     pub fn without_api_key(mut self) -> Self {
         self.scrub_api_key = true;
+        self
+    }
+
+    /// Pipes the task to the CLI's stdin instead of passing it as an argument.
+    ///
+    /// cursor-agent silently exits 0 with empty output when an argv prompt nears
+    /// 500KB, so any CLI that reads stdin in print mode should use this.
+    pub fn task_via_stdin(mut self) -> Self {
+        self.task_via_stdin = true;
         self
     }
 
@@ -43,10 +56,30 @@ impl CliAgentProvider {
             ],
         )
         .without_api_key()
+        .task_via_stdin()
     }
 
     pub fn hermes() -> Self {
         Self::new("hermes", vec!["-z".to_string()])
+    }
+
+    // Bills the Cursor login (notional); the key scrub keeps ANTHROPIC_API_KEY out entirely.
+    pub fn cursor() -> Self {
+        Self::new(
+            "cursor-agent",
+            vec![
+                "-p".to_string(),
+                // Pinned: the CLI's sticky default silently follows the last interactive model.
+                "--model=composer-2.5".to_string(),
+                "--output-format=text".to_string(),
+                // Print mode refuses to start in an untrusted working directory.
+                "--trust".to_string(),
+                // Print mode denies tool calls needing approval; this allows web lookups.
+                "--force".to_string(),
+            ],
+        )
+        .without_api_key()
+        .task_via_stdin()
     }
 }
 
@@ -76,10 +109,28 @@ impl AgentProvider for CliAgentProvider {
         if self.scrub_api_key {
             command.env_remove("ANTHROPIC_API_KEY");
         }
-        command.args(&self.args).arg(&task);
+        command.args(&self.args);
+        if self.task_via_stdin {
+            command.stdin(Stdio::piped());
+        } else {
+            command.arg(&task).stdin(Stdio::null());
+        }
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+        let via_stdin = self.task_via_stdin;
+        let run_child = async {
+            let mut child = command.spawn()?;
+            if via_stdin {
+                // Taking stdin moves it out of the child; dropping it closes the
+                // pipe so the CLI sees EOF and knows the prompt is complete.
+                let mut stdin = child.stdin.take().expect("stdin was configured as piped");
+                stdin.write_all(task.as_bytes()).await?;
+            }
+            child.wait_with_output().await
+        };
 
         let result =
-            tokio::time::timeout(Duration::from_secs(request.timeout_secs), command.output()).await;
+            tokio::time::timeout(Duration::from_secs(request.timeout_secs), run_child).await;
 
         // Nested Results: the outer is the timeout, the inner is the spawn.
         let output = match result {
@@ -119,6 +170,17 @@ impl AgentProvider for CliAgentProvider {
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let (text, cost_usd) = parse_agent_output(&stdout);
+
+        // A zero-length answer is never a real answer; cursor-agent produces one
+        // (exit 0, silent) when it chokes on input, and accepting it poisons
+        // every step downstream.
+        if text.trim().is_empty() {
+            return Err(FluxError::Agent(format!(
+                "'{}' exited 0 but produced no output ({} byte task)",
+                self.binary,
+                task.len(),
+            )));
+        }
 
         Ok(AgentResponse {
             output: text,

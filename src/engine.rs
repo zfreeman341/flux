@@ -16,6 +16,7 @@
 
 use std::collections::HashMap;
 use std::io::Write;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -26,9 +27,14 @@ use tracing::{info, instrument, warn};
 
 use crate::{
     FluxError,
+    artifact::{Artifact, Schema, Source},
     cost::{self, BudgetTracker},
+    http::HttpExecutor,
+    mcp::{McpExecutor, McpRunContext},
     provider::{AgentProvider, AgentRequest, Billing, CompletionRequest, LlmProvider},
-    workflow::{Step, WorkflowFile},
+    registry::Registry,
+    template::FanItem,
+    workflow::{Step, StepKind, WorkflowFile},
 };
 
 // Wraps the caller's borrow so steps in a wave can share it without a 'static bound.
@@ -37,7 +43,7 @@ type BudgetLock<'a> = Mutex<&'a mut BudgetTracker>;
 struct StepContext<'a> {
     workflow: &'a WorkflowFile,
     inputs: &'a HashMap<String, String>,
-    step_outputs: &'a HashMap<String, String>,
+    step_outputs: &'a HashMap<String, Artifact>,
     /// Pre-run cost estimates by step id, used by the reservation guard below.
     estimates: &'a HashMap<String, f64>,
     output_reserve: f64,
@@ -47,6 +53,14 @@ pub struct Engine {
     // None when no API key was configured, which is valid if every step is an agent step.
     llm: Option<Arc<dyn LlmProvider>>,
     agent: Arc<dyn AgentProvider>,
+    // Named overrides; a step's `provider` selects one, anything else uses `agent`.
+    agents: HashMap<String, Arc<dyn AgentProvider>>,
+    http: Arc<HttpExecutor>,
+    mcp: Arc<McpExecutor>,
+    // Where schema, transform, and probe names in a workflow become behavior.
+    registry: Arc<Registry>,
+    // When set, step results are written here as they complete, surviving a failed run.
+    checkpoint_dir: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -64,29 +78,111 @@ pub struct StepResult {
     pub id: String,
     pub model: String,
     pub prompt: String,
-    pub output: String,
+    pub output: Artifact,
     pub input_tokens: u32,
     pub output_tokens: u32,
     pub cost_usd: f64,
     pub duration: Duration,
 }
 
+impl StepResult {
+    /// The prose form of this step's output, for run artifacts and assertions.
+    pub fn text(&self) -> String {
+        self.output.as_prompt_text()
+    }
+
+    /// The per-step debug artifact: prompt, output, and cost/timing metadata.
+    pub fn to_markdown(&self) -> String {
+        format!(
+            "# {id}\n\nModel: `{model}`  \nTokens: {input_t} in / {output_t} out  \nCost: ${cost:.4}  \nDuration: {dur:.1}s\n\n## Prompt\n\n{prompt}\n\n## Output\n\n{output}\n",
+            id = self.id,
+            model = self.model,
+            input_t = self.input_tokens,
+            output_t = self.output_tokens,
+            cost = self.cost_usd,
+            dur = self.duration.as_secs_f64(),
+            prompt = self.prompt,
+            output = self.text(),
+        )
+    }
+}
+
 impl Engine {
-    pub fn new(llm: Arc<dyn LlmProvider>, agent: Arc<dyn AgentProvider>) -> Self {
-        Self {
+    pub fn new(llm: Arc<dyn LlmProvider>, agent: Arc<dyn AgentProvider>) -> crate::Result<Self> {
+        Ok(Self {
             llm: Some(llm),
             agent,
-        }
+            agents: HashMap::new(),
+            http: Arc::new(HttpExecutor::new(crate::http::client()?)),
+            mcp: Arc::new(McpExecutor),
+            registry: Arc::new(Registry::builtin()),
+            checkpoint_dir: None,
+        })
     }
 
     /// For workflows whose every step runs through an agent CLI, so no API key is needed.
-    pub fn agents_only(agent: Arc<dyn AgentProvider>) -> Self {
-        Self { llm: None, agent }
+    pub fn agents_only(agent: Arc<dyn AgentProvider>) -> crate::Result<Self> {
+        Ok(Self {
+            llm: None,
+            agent,
+            agents: HashMap::new(),
+            http: Arc::new(HttpExecutor::new(crate::http::client()?)),
+            mcp: Arc::new(McpExecutor),
+            registry: Arc::new(Registry::builtin()),
+            checkpoint_dir: None,
+        })
+    }
+
+    /// Replaces the built-in registry, for callers that register their own
+    /// schemas, transforms, or probes.
+    pub fn with_registry(mut self, registry: Arc<Registry>) -> Self {
+        self.registry = registry;
+        self
+    }
+
+    /// Registers a provider for steps whose `provider` names it. Builder-style,
+    /// so `main` can chain registrations after construction.
+    pub fn with_agent(mut self, name: impl Into<String>, provider: Arc<dyn AgentProvider>) -> Self {
+        self.agents.insert(name.into(), provider);
+        self
+    }
+
+    /// Writes each step's result into `dir` as it completes, so a run that
+    /// fails partway still leaves its finished steps' outputs on disk.
+    pub fn with_checkpoint_dir(mut self, dir: PathBuf) -> Self {
+        self.checkpoint_dir = Some(dir);
+        self
+    }
+
+    // Checkpointing is best-effort: a full disk must not kill a healthy run.
+    fn checkpoint(&self, step: &StepResult) {
+        let Some(dir) = &self.checkpoint_dir else {
+            return;
+        };
+        let write = std::fs::create_dir_all(dir)
+            .and_then(|()| std::fs::write(dir.join(format!("{}.md", step.id)), step.to_markdown()));
+        if let Err(e) = write {
+            warn!(step = %step.id, error = %e, "failed to checkpoint step result");
+        }
+    }
+
+    fn agent_for(&self, step: &Step) -> &Arc<dyn AgentProvider> {
+        step.provider
+            .as_deref()
+            .and_then(|name| self.agents.get(name))
+            .unwrap_or(&self.agent)
+    }
+
+    // Unknown names were already rejected by `Step::resolve`, so a miss here is just "none".
+    fn output_schema(&self, step: &Step) -> Option<Schema> {
+        step.output_type
+            .as_deref()
+            .and_then(|name| self.registry.schema(name).ok())
     }
 
     // Cost is an API-equivalent figure, so it needs no pre-charge and no ceiling check.
     fn is_notional(&self, step: &Step) -> bool {
-        step.is_agent() && self.agent.billing() == Billing::Notional
+        step.is_agent() && self.agent_for(step).billing() == Billing::Notional
     }
 
     fn require_llm(&self) -> crate::Result<&Arc<dyn LlmProvider>> {
@@ -107,7 +203,7 @@ impl Engine {
         budget: &mut BudgetTracker,
     ) -> crate::Result<RunResult> {
         let run_start = Instant::now();
-        let mut step_outputs: HashMap<String, String> = HashMap::new();
+        let mut step_outputs: HashMap<String, Artifact> = HashMap::new();
         let mut step_results: Vec<StepResult> = Vec::new();
 
         // Reserved so a fan-out finishing just under the cap cannot starve the synthesis.
@@ -149,10 +245,20 @@ impl Engine {
             };
 
             // join_all preserves input order, so results stay deterministic run to run.
+            // Every success is checkpointed before an error propagates, so a failed wave keeps finished work.
+            let mut first_err: Option<FluxError> = None;
             for result in wave_results {
-                let step_result = result?;
-                step_outputs.insert(step_result.id.clone(), step_result.output.clone());
-                step_results.push(step_result);
+                match result {
+                    Ok(step_result) => {
+                        self.checkpoint(&step_result);
+                        step_outputs.insert(step_result.id.clone(), step_result.output.clone());
+                        step_results.push(step_result);
+                    }
+                    Err(e) => first_err = first_err.or(Some(e)),
+                }
+            }
+            if let Some(e) = first_err {
+                return Err(e);
             }
         }
 
@@ -165,7 +271,7 @@ impl Engine {
 
         let budget = budget.into_inner();
         Ok(RunResult {
-            output,
+            output: output.as_prompt_text(),
             step_results,
             spent_usd: budget.spent_usd,
             notional_usd: budget.notional_usd,
@@ -183,8 +289,10 @@ impl Engine {
         let step_start = Instant::now();
 
         // Steps in a wave check the same snapshot, so a wave can overshoot by one estimate.
+        // A free step is exempt: an HTTP fan-out draws nothing, and gating it on
+        // headroom would let cheap deterministic work be skipped for no saving.
         let is_output_step = step.id == ctx.workflow.output.step;
-        if !is_output_step && !self.is_notional(step) {
+        if !is_output_step && !self.is_notional(step) && !step.is_free() {
             let step_estimate = ctx.estimates.get(&step.id).copied().unwrap_or(0.0);
             let tracker = budget.lock().await;
             let headroom = tracker.limit_usd - tracker.spent_usd - ctx.output_reserve;
@@ -215,15 +323,39 @@ impl Engine {
         // Snapshot so a pre-charge can be refunded if the step dies before any agent runs.
         let pre_step_spent = budget.lock().await.spent_usd;
 
-        let attempt = if step.parallel_over.is_some() || !step.parallel_items.is_empty() {
-            self.run_parallel(step, &step_inputs, ctx.step_outputs, budget, step_start)
+        // Exhaustive: adding a step kind will not compile until it is handled here.
+        let attempt = match step.resolve(&self.registry)? {
+            StepKind::Transform(t) => {
+                self.run_transform(step, &t, ctx.step_outputs, step_start)
+                    .await
+            }
+            StepKind::Http(h) => {
+                self.run_http(step, &h, &step_inputs, ctx.step_outputs, step_start)
+                    .await
+            }
+            StepKind::Mcp(m) => {
+                self.run_mcp(
+                    step,
+                    &m,
+                    &ctx.workflow.mcp,
+                    &step_inputs,
+                    ctx.step_outputs,
+                    step_start,
+                )
                 .await
-        } else if step.is_agent() {
-            self.run_single_agent(step, &step_inputs, ctx.step_outputs, budget, step_start)
-                .await
-        } else {
-            self.run_llm(step, &step_inputs, ctx.step_outputs, budget, step_start)
-                .await
+            }
+            StepKind::Agent(_) if step.fans_out() => {
+                self.run_parallel(step, &step_inputs, ctx.step_outputs, budget, step_start)
+                    .await
+            }
+            StepKind::Agent(_) if step.is_agent() => {
+                self.run_single_agent(step, &step_inputs, ctx.step_outputs, budget, step_start)
+                    .await
+            }
+            StepKind::Agent(_) => {
+                self.run_llm(step, &step_inputs, ctx.step_outputs, budget, step_start)
+                    .await
+            }
         };
 
         let step_result = match attempt {
@@ -271,6 +403,27 @@ impl Engine {
                     step_start,
                 )
             }
+            // A dead agent on a non-output step degrades the run, it does not
+            // sink it — the same posture as a failed fan-out item. The output
+            // step is exempt: with no synthesis there is nothing to salvage.
+            Err(FluxError::Agent(ref msg)) if !is_output_step => {
+                let mut tracker = budget.lock().await;
+                let phantom = tracker.spent_usd - pre_step_spent;
+                if phantom > 0.0 {
+                    tracker.refund(phantom);
+                }
+                drop(tracker);
+                warn!(step = %step.id, error = %msg, "agent failed; skipping step with placeholder");
+                skipped_step(
+                    step,
+                    format!(
+                        "[SKIPPED — agent call in step '{}' failed: {msg}. \
+                         Synthesis below uses the steps that ran.]",
+                        step.id
+                    ),
+                    step_start,
+                )
+            }
             Err(e) => return Err(e),
         };
 
@@ -278,7 +431,7 @@ impl Engine {
         if let Some(ref path) = step.appends_to
             && let Err(e) = append_to_state(
                 path,
-                &step_result.output,
+                &step_result.output.as_prompt_text(),
                 &ctx.workflow.workflow.name,
                 &step.id,
             )
@@ -289,12 +442,135 @@ impl Engine {
         Ok(step_result)
     }
 
+    // Deterministic and free: no budget interaction at all.
+    async fn run_transform(
+        &self,
+        step: &Step,
+        transform: &crate::workflow::TransformStep<'_>,
+        step_outputs: &HashMap<String, Artifact>,
+        step_start: Instant,
+    ) -> crate::Result<StepResult> {
+        info!(step = %step.id, transform = %transform.name, "executing transform step");
+
+        // Dependency order, so a transform over two upstreams concatenates predictably.
+        let upstream: Vec<&Artifact> = step
+            .depends_on
+            .iter()
+            .filter_map(|id| step_outputs.get(id))
+            .collect();
+
+        let rows = self
+            .registry
+            .transform(transform.name)?
+            .apply(&upstream, transform.args);
+        info!(
+            transform = transform.name,
+            rows = rows.len(),
+            "transform complete"
+        );
+        let output = Artifact::records(transform.output_type.clone(), rows);
+
+        Ok(free_step(step, transform.name, output, step_start))
+    }
+
+    async fn run_http(
+        &self,
+        step: &Step,
+        http: &crate::workflow::HttpStep<'_>,
+        inputs: &HashMap<String, String>,
+        step_outputs: &HashMap<String, Artifact>,
+        step_start: Instant,
+    ) -> crate::Result<StepResult> {
+        info!(step = %step.id, "executing http step");
+
+        let items = if step.fans_out() {
+            let items = fan_items(step, step_outputs)?;
+            if items.is_empty() {
+                info!(step = %step.id, "fan-out over zero items; emitting empty output");
+                return Ok(free_step(
+                    step,
+                    "http",
+                    Artifact::records(http.output_type.clone(), Vec::new()),
+                    step_start,
+                ));
+            }
+            items
+        } else {
+            Vec::new()
+        };
+
+        let output = self
+            .http
+            .run(
+                http,
+                &items,
+                inputs,
+                step_outputs,
+                step.max_concurrent.unwrap_or(DEFAULT_CONCURRENCY),
+                &self.registry,
+            )
+            .await?;
+
+        Ok(free_step(step, "http", output, step_start))
+    }
+
+    async fn run_mcp(
+        &self,
+        step: &Step,
+        mcp: &crate::workflow::McpStep<'_>,
+        config: &crate::workflow::McpConfig,
+        inputs: &HashMap<String, String>,
+        step_outputs: &HashMap<String, Artifact>,
+        step_start: Instant,
+    ) -> crate::Result<StepResult> {
+        info!(step = %step.id, server = mcp.server, tool = mcp.tool, "executing MCP step");
+
+        let server = config.servers.get(mcp.server).ok_or_else(|| {
+            FluxError::Config(format!(
+                "step '{}' references unknown MCP server '{}'",
+                step.id, mcp.server
+            ))
+        })?;
+        let items = if step.fans_out() {
+            let items = fan_items(step, step_outputs)?;
+            if items.is_empty() {
+                info!(step = %step.id, "fan-out over zero items; emitting empty output");
+                return Ok(free_step(
+                    step,
+                    "mcp",
+                    Artifact::records(Schema::mcp_response(), Vec::new()),
+                    step_start,
+                ));
+            }
+            items
+        } else {
+            Vec::new()
+        };
+
+        let output = self
+            .mcp
+            .run(
+                mcp.server,
+                server,
+                mcp,
+                McpRunContext {
+                    items: &items,
+                    inputs,
+                    step_outputs,
+                    max_concurrent: step.max_concurrent.unwrap_or(DEFAULT_CONCURRENCY),
+                    timeout_secs: step.timeout_secs,
+                },
+            )
+            .await?;
+        Ok(free_step(step, "mcp", output, step_start))
+    }
+
     // Executes a step via the Anthropic API (the original path).
     async fn run_llm(
         &self,
         step: &Step,
         inputs: &HashMap<String, String>,
-        step_outputs: &HashMap<String, String>,
+        step_outputs: &HashMap<String, Artifact>,
         budget: &BudgetLock<'_>,
         step_start: Instant,
     ) -> crate::Result<StepResult> {
@@ -341,7 +617,11 @@ impl Engine {
             id: step.id.clone(),
             model: step.model.clone(),
             prompt,
-            output: append_sources(response.content, &response.sources),
+            output: model_output(
+                response.content,
+                &response.sources,
+                self.output_schema(step),
+            ),
             input_tokens: response.input_tokens,
             output_tokens: response.output_tokens,
             cost_usd: cost,
@@ -354,7 +634,7 @@ impl Engine {
         &self,
         step: &Step,
         inputs: &HashMap<String, String>,
-        step_outputs: &HashMap<String, String>,
+        step_outputs: &HashMap<String, Artifact>,
         budget: &BudgetLock<'_>,
         step_start: Instant,
     ) -> crate::Result<StepResult> {
@@ -374,7 +654,7 @@ impl Engine {
 
         let prompt = crate::template::render_prompt(&step.prompt, inputs, step_outputs)?;
         let response = self
-            .agent
+            .agent_for(step)
             .run(AgentRequest {
                 task: prompt.clone(),
                 timeout_secs: step.timeout_secs.unwrap_or(300),
@@ -403,7 +683,7 @@ impl Engine {
             id: step.id.clone(),
             model: provider_name.to_string(),
             prompt,
-            output: response.output,
+            output: model_output(response.output, &[], self.output_schema(step)),
             input_tokens: 0,
             output_tokens: 0,
             cost_usd: cost,
@@ -415,64 +695,26 @@ impl Engine {
         &self,
         step: &Step,
         inputs: &HashMap<String, String>,
-        step_outputs: &HashMap<String, String>,
+        step_outputs: &HashMap<String, Artifact>,
         budget: &BudgetLock<'_>,
         step_start: Instant,
     ) -> crate::Result<StepResult> {
-        // The validator guarantees exactly one of the two item sources is set.
-        let mut items: Vec<String> = if !step.parallel_items.is_empty() {
-            step.parallel_items.clone()
-        } else {
-            let upstream_id = step.parallel_over.as_deref().unwrap();
-            let upstream_output = step_outputs.get(upstream_id).ok_or_else(|| {
-                FluxError::Config(format!(
-                    "step '{}' parallel_over '{}' which has not yet run",
-                    step.id, upstream_id
-                ))
-            })?;
+        let items = fan_items(step, step_outputs)?;
 
-            let (parsed, fenced) = parse_fan_out_items(upstream_output);
-            if !fenced {
-                warn!(
-                    step = %step.id,
-                    upstream = %upstream_id,
-                    items = parsed.len(),
-                    "upstream output had no fenced block; every non-blank line became a \
-                     fan-out item. Have the upstream step wrap its list in ``` fences."
-                );
-            }
-
-            if parsed.is_empty() {
-                return Err(FluxError::Config(format!(
-                    "step '{}' parallel_over '{}' produced no items to fan out over",
-                    step.id, upstream_id
-                )));
-            }
-            parsed
-        };
-
-        // Safety valve for a chatty planner: cap the fan-out rather than trust the count.
-        if let Some(cap) = step.max_items
-            && items.len() > cap
-        {
-            warn!(
-                step = %step.id,
-                found = items.len(),
-                cap,
-                "planner output more lines than max_items; truncating fan-out"
-            );
-            items.truncate(cap);
+        // Only reachable with allow_empty; produce a well-typed empty output so
+        // downstream consumers (a union, a template) see zero rows, not a hole.
+        if items.is_empty() {
+            info!(step = %step.id, "fan-out over zero items; emitting empty output");
+            return Ok(empty_fan_out(step, self.output_schema(step), step_start));
         }
 
         // Rendered before any budget charge, so a template error leaves no phantom charge.
         let item_prompts: Vec<(String, String)> = items
             .iter()
             .map(|item| {
-                let mut inputs_with_item = inputs.clone();
-                inputs_with_item.insert("item".to_string(), item.clone());
                 let prompt =
-                    crate::template::render_prompt(&step.prompt, &inputs_with_item, step_outputs)?;
-                Ok((item.clone(), prompt))
+                    crate::template::render(&step.prompt, inputs, step_outputs, Some(item))?;
+                Ok((item.label.clone(), prompt))
             })
             .collect::<crate::Result<_>>()?;
 
@@ -508,7 +750,7 @@ impl Engine {
         }
 
         let semaphore = Arc::new(Semaphore::new(step.max_concurrent.unwrap_or(3)));
-        let agent = Arc::clone(&self.agent);
+        let agent = Arc::clone(self.agent_for(step));
         let step_id = step.id.clone();
         let timeout_secs = step.timeout_secs.unwrap_or(300);
 
@@ -549,11 +791,17 @@ impl Engine {
         }
 
         let mut output_parts: Vec<String> = Vec::new();
+        let mut row_parts: Vec<serde_json::Value> = Vec::new();
         let mut actual_cost = 0.0f64;
         for (item, result) in results {
             match result {
                 Ok(resp) => {
                     actual_cost += resp.cost_usd.unwrap_or(per_call);
+                    if step.output_type.is_some()
+                        && let Some(rows) = extract_json_rows(&resp.output)
+                    {
+                        row_parts.extend(rows);
+                    }
                     info!(
                         step = %step.id,
                         item = %item,
@@ -594,7 +842,7 @@ impl Engine {
             id: step.id.clone(),
             model: provider_name.to_string(),
             prompt: step.prompt.clone(),
-            output: combined,
+            output: fan_out_output(combined, &row_parts, self.output_schema(step)),
             input_tokens: 0,
             output_tokens: 0,
             cost_usd: actual_cost,
@@ -645,6 +893,7 @@ impl Engine {
         let results = join_all(futures).await;
 
         let mut output_parts: Vec<String> = Vec::new();
+        let mut row_parts: Vec<serde_json::Value> = Vec::new();
         let mut input_tokens = 0u32;
         let mut output_tokens = 0u32;
         let mut total_cost = 0.0f64;
@@ -659,10 +908,15 @@ impl Engine {
                     );
                     input_tokens += resp.input_tokens;
                     output_tokens += resp.output_tokens;
+                    if step.output_type.is_some()
+                        && let Some(rows) = extract_json_rows(&resp.content)
+                    {
+                        row_parts.extend(rows);
+                    }
                     output_parts.push(format!(
                         "--- {} ---\n{}",
                         item,
-                        append_sources(resp.content, &resp.sources)
+                        model_output(resp.content, &resp.sources, None).as_prompt_text()
                     ));
                 }
                 Err(e) => {
@@ -696,7 +950,7 @@ impl Engine {
             id: step.id.clone(),
             model: step.model.clone(),
             prompt: step.prompt.clone(),
-            output: combined,
+            output: fan_out_output(combined, &row_parts, self.output_schema(step)),
             input_tokens,
             output_tokens,
             cost_usd: total_cost,
@@ -705,8 +959,30 @@ impl Engine {
     }
 }
 
-// The explanation is ordinary prose so the synthesizer can read it as prompt text.
-fn skipped_step(step: &Step, output: String, step_start: Instant) -> StepResult {
+/// Records if the fan-out declared a schema and any branch produced rows, else prose.
+///
+/// Falling back to prose matters: one branch returning garbage should not erase
+/// the branches that worked, and the synthesizer can still read the text form.
+fn fan_out_output(
+    combined: String,
+    rows: &[serde_json::Value],
+    output_type: Option<Schema>,
+) -> Artifact {
+    match output_type {
+        Some(schema) if !rows.is_empty() => Artifact::records(schema, rows.to_vec()),
+        _ => Artifact::text(combined),
+    }
+}
+
+/// Default in-flight requests for a fan-out, matching the LLM path.
+const DEFAULT_CONCURRENCY: usize = 3;
+
+// A typed empty result for an allow_empty fan-out that had nothing to do.
+fn empty_fan_out(step: &Step, schema: Option<Schema>, step_start: Instant) -> StepResult {
+    let output = match schema {
+        Some(schema) => Artifact::records(schema, Vec::new()),
+        None => Artifact::text(format!("[step '{}' had no items to process]", step.id)),
+    };
     StepResult {
         id: step.id.clone(),
         model: step.provider.clone().unwrap_or_else(|| step.model.clone()),
@@ -719,18 +995,155 @@ fn skipped_step(step: &Step, output: String, step_start: Instant) -> StepResult 
     }
 }
 
-// Attached to the output so citations flow into downstream prompts and run artifacts.
-fn append_sources(mut output: String, sources: &[String]) -> String {
-    if sources.is_empty() {
-        return output;
+// The explanation is ordinary prose so the synthesizer can read it as prompt text.
+fn skipped_step(step: &Step, output: String, step_start: Instant) -> StepResult {
+    StepResult {
+        id: step.id.clone(),
+        model: step.provider.clone().unwrap_or_else(|| step.model.clone()),
+        prompt: String::new(),
+        output: Artifact::text(output),
+        input_tokens: 0,
+        output_tokens: 0,
+        cost_usd: 0.0,
+        duration: step_start.elapsed(),
     }
-    output.push_str("\n\nSources:\n");
-    for source in sources {
-        output.push_str("- ");
-        output.push_str(source);
-        output.push('\n');
+}
+
+// Http and transform steps report no tokens and no cost by construction.
+fn free_step(step: &Step, model: &str, output: Artifact, step_start: Instant) -> StepResult {
+    let duration = step_start.elapsed();
+    info!(
+        step = %step.id,
+        rows = output.rows().len(),
+        duration_secs = format!("{:.1}", duration.as_secs_f64()),
+        "free step complete"
+    );
+    StepResult {
+        id: step.id.clone(),
+        model: model.to_string(),
+        prompt: String::new(),
+        output,
+        input_tokens: 0,
+        output_tokens: 0,
+        cost_usd: 0.0,
+        duration,
     }
-    output
+}
+
+/// Wraps a model's reply, promoting it to records when the step declared a schema.
+///
+/// A model told to emit JSON still sometimes wraps it in prose or fences, so the
+/// JSON is located rather than parsed from position zero. If nothing parses, the
+/// reply degrades to text instead of failing the step.
+fn model_output(content: String, sources: &[String], output_type: Option<Schema>) -> Artifact {
+    let sources: Vec<Source> = sources.iter().map(|s| Source::parse(s)).collect();
+    let Some(schema) = output_type else {
+        return Artifact::Text {
+            body: content,
+            sources,
+        };
+    };
+
+    match extract_json_rows(&content) {
+        Some(rows) => Artifact::records(schema, rows),
+        None => {
+            warn!(
+                schema = schema.name(),
+                "step declared output_type but produced no parsable JSON; keeping it as text"
+            );
+            Artifact::Text {
+                body: content,
+                sources,
+            }
+        }
+    }
+}
+
+// Accepts a bare array, a bare object, or either wrapped in a fenced block.
+fn extract_json_rows(content: &str) -> Option<Vec<serde_json::Value>> {
+    let candidates = last_fenced_block(content)
+        .into_iter()
+        .chain(std::iter::once(content.to_string()));
+
+    for candidate in candidates {
+        let trimmed = candidate.trim();
+        let start = trimmed.find(['[', '{'])?;
+        let end = trimmed.rfind([']', '}'])?;
+        if end <= start {
+            continue;
+        }
+        let slice = &trimmed[start..=end];
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(slice) {
+            return Some(match value {
+                serde_json::Value::Array(rows) => rows,
+                other => vec![other],
+            });
+        }
+    }
+    None
+}
+
+/// Resolves the units a fan-out step runs over.
+///
+/// Records upstream fan out row-wise, so `{{ item.token }}` works; prose upstream
+/// falls back to the fenced-list parsing that planner steps rely on.
+fn fan_items(step: &Step, step_outputs: &HashMap<String, Artifact>) -> crate::Result<Vec<FanItem>> {
+    let mut items: Vec<FanItem> = if !step.parallel_items.is_empty() {
+        step.parallel_items.iter().map(FanItem::from_text).collect()
+    } else {
+        let upstream_id = step.parallel_over.as_deref().ok_or_else(|| {
+            FluxError::Config(format!("step '{}' fans out over nothing", step.id))
+        })?;
+        let upstream = step_outputs.get(upstream_id).ok_or_else(|| {
+            FluxError::Config(format!(
+                "step '{}' parallel_over '{}' which has not yet run",
+                step.id, upstream_id
+            ))
+        })?;
+
+        match upstream {
+            Artifact::Records { rows, .. } => {
+                rows.iter().cloned().map(FanItem::from_record).collect()
+            }
+            Artifact::Text { body, .. } => {
+                let (parsed, fenced) = parse_fan_out_items(body);
+                if !fenced {
+                    warn!(
+                        step = %step.id,
+                        upstream = %upstream_id,
+                        items = parsed.len(),
+                        "upstream output had no fenced block; every non-blank line became a \
+                         fan-out item. Have the upstream step wrap its list in ``` fences."
+                    );
+                }
+                parsed.into_iter().map(FanItem::from_text).collect()
+            }
+        }
+    };
+
+    if items.is_empty() {
+        if step.allow_empty {
+            return Ok(items);
+        }
+        return Err(FluxError::Config(format!(
+            "step '{}' produced no items to fan out over",
+            step.id
+        )));
+    }
+
+    // Safety valve for a chatty planner: cap the fan-out rather than trust the count.
+    if let Some(cap) = step.max_items
+        && items.len() > cap
+    {
+        warn!(
+            step = %step.id,
+            found = items.len(),
+            cap,
+            "more fan-out items than max_items; truncating"
+        );
+        items.truncate(cap);
+    }
+    Ok(items)
 }
 
 // Replaces what was pre-charged from estimates once the actual cost is known.
@@ -944,6 +1357,14 @@ fn step_depth<'a>(
 mod tests {
     use super::*;
 
+    fn new_engine(llm: Arc<dyn LlmProvider>, agent: Arc<dyn AgentProvider>) -> Engine {
+        Engine::new(llm, agent).unwrap()
+    }
+
+    fn new_agents_only(agent: Arc<dyn AgentProvider>) -> Engine {
+        Engine::agents_only(agent).unwrap()
+    }
+
     // Via TOML rather than struct literals, so tests use the same parse path as real runs.
     fn step(src: &str) -> Step {
         toml::from_str(src).expect("test step TOML should parse")
@@ -1145,7 +1566,7 @@ step = "synth"
     #[tokio::test]
     async fn parallel_fan_out_without_provider_uses_the_api() {
         let wf = workflow("");
-        let engine = Engine::new(Arc::new(MockLlm), Arc::new(MockAgent));
+        let engine = new_engine(Arc::new(MockLlm), Arc::new(MockAgent));
         let mut budget = BudgetTracker::new(5.0);
 
         let result = engine
@@ -1154,12 +1575,12 @@ step = "synth"
             .expect("workflow should succeed");
 
         let fan = result.step_results.iter().find(|s| s.id == "fan").unwrap();
-        assert!(fan.output.contains("--- alpha ---"), "{}", fan.output);
-        assert!(fan.output.contains("--- beta ---"), "{}", fan.output);
+        assert!(fan.text().contains("--- alpha ---"), "{}", fan.text());
+        assert!(fan.text().contains("--- beta ---"), "{}", fan.text());
         assert!(
-            fan.output.contains("researched[look into alpha]"),
+            fan.text().contains("researched[look into alpha]"),
             "fan-out should hit the API mock, not the agent: {}",
-            fan.output
+            fan.text()
         );
         // Two items × the mock's 100/50 tokens, actually charged to the budget.
         assert_eq!(fan.input_tokens, 200);
@@ -1168,17 +1589,192 @@ step = "synth"
         assert!(budget.spent_usd >= fan.cost_usd);
         // Cited sources are appended per item so they flow downstream.
         assert!(
-            fan.output
+            fan.text()
                 .contains("Sources:\n- Mock Source — https://example.com/mock"),
             "{}",
-            fan.output
+            fan.text()
         );
+    }
+
+    struct FailingAgent;
+
+    #[async_trait]
+    impl AgentProvider for FailingAgent {
+        async fn run(&self, _request: AgentRequest) -> crate::Result<AgentResponse> {
+            Err(FluxError::Agent("agent timed out after 300s".into()))
+        }
+    }
+
+    // The failure that cost a 40-minute run: one single-call agent step timing
+    // out. It must degrade to a placeholder, not abort the workflow.
+    #[tokio::test]
+    async fn failed_single_agent_step_skips_instead_of_sinking_the_run() {
+        let wf: WorkflowFile = toml::from_str(
+            r#"
+[workflow]
+name = "t"
+[budget]
+max_usd = 5.0
+[[steps]]
+id = "flaky"
+provider = "claude-code"
+prompt = "research"
+cost_per_call_usd = 0.1
+[[steps]]
+id = "synth"
+prompt = "combine {{ flaky.output }}"
+depends_on = ["flaky"]
+[output]
+step = "synth"
+"#,
+        )
+        .unwrap();
+
+        let engine = new_engine(Arc::new(MockLlm), Arc::new(FailingAgent));
+        let mut budget = BudgetTracker::new(5.0);
+        let result = engine
+            .run(&wf, &HashMap::new(), &mut budget)
+            .await
+            .expect("a failed non-output agent step must not fail the run");
+
+        // The synthesizer saw the placeholder.
+        assert!(result.output.contains("SKIPPED"), "{}", result.output);
+        // The $0.10 pre-charge was refunded; only the synth step's tokens remain.
+        let flaky = result
+            .step_results
+            .iter()
+            .find(|s| s.id == "flaky")
+            .unwrap();
+        assert_eq!(flaky.cost_usd, 0.0);
+        assert!(budget.spent_usd < 0.01, "{}", budget.spent_usd);
+    }
+
+    #[tokio::test]
+    async fn failed_agent_output_step_still_fails_the_run() {
+        let wf: WorkflowFile = toml::from_str(
+            r#"
+[workflow]
+name = "t"
+[budget]
+max_usd = 5.0
+[[steps]]
+id = "only"
+provider = "claude-code"
+prompt = "research"
+[output]
+step = "only"
+"#,
+        )
+        .unwrap();
+
+        let engine = new_engine(Arc::new(MockLlm), Arc::new(FailingAgent));
+        let mut budget = BudgetTracker::new(5.0);
+        let err = engine.run(&wf, &HashMap::new(), &mut budget).await;
+        assert!(err.is_err(), "no output step means nothing to salvage");
+    }
+
+    // The 503 outage that lost a 49-minute run: an output step failing must
+    // leave the earlier steps' checkpoints on disk, not evaporate them.
+    #[tokio::test]
+    async fn failed_run_checkpoints_completed_steps() {
+        let wf: WorkflowFile = toml::from_str(
+            r#"
+[workflow]
+name = "t"
+[budget]
+max_usd = 5.0
+[[steps]]
+id = "plan"
+prompt = "PLAN"
+[[steps]]
+id = "out"
+provider = "claude-code"
+prompt = "synthesize {{ plan.output }}"
+depends_on = ["plan"]
+[output]
+step = "out"
+"#,
+        )
+        .unwrap();
+
+        let dir = std::env::temp_dir().join(format!("flux-ckpt-test-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+
+        let engine =
+            new_engine(Arc::new(MockLlm), Arc::new(FailingAgent)).with_checkpoint_dir(dir.clone());
+        let mut budget = BudgetTracker::new(5.0);
+        let err = engine.run(&wf, &HashMap::new(), &mut budget).await;
+        assert!(err.is_err());
+
+        let plan_md = std::fs::read_to_string(dir.join("plan.md")).expect("plan.md checkpoint");
+        assert!(plan_md.contains("alpha\nbeta"), "{plan_md}");
+        assert!(
+            !dir.join("out.md").exists(),
+            "failed step must not checkpoint"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // A fallback step's steady state: nothing upstream is left to do, so the
+    // fan-out has zero items. allow_empty must yield typed empty output and
+    // let the rest of the workflow proceed.
+    #[tokio::test]
+    async fn allow_empty_fan_out_over_zero_items_succeeds() {
+        let wf: WorkflowFile = toml::from_str(
+            r#"
+[workflow]
+name = "t"
+[budget]
+max_usd = 5.0
+[[steps]]
+id = "plan"
+prompt = "PLAN"
+[[steps]]
+id = "todo"
+kind = "transform"
+transform = "dedupe"
+output_type = "record"
+depends_on = ["plan"]
+[[steps]]
+id = "fallback"
+provider = "claude-code"
+prompt = "find {{ item.name }}"
+parallel_over = "todo"
+depends_on = ["todo"]
+allow_empty = true
+output_type = "record"
+[[steps]]
+id = "synth"
+prompt = "combine {{ fallback.count }}"
+depends_on = ["fallback"]
+[output]
+step = "synth"
+"#,
+        )
+        .unwrap();
+
+        let engine = new_engine(Arc::new(MockLlm), Arc::new(MockAgent));
+        let mut budget = BudgetTracker::new(5.0);
+        let result = engine
+            .run(&wf, &HashMap::new(), &mut budget)
+            .await
+            .expect("empty fan-out with allow_empty should not fail the run");
+
+        let fallback = result
+            .step_results
+            .iter()
+            .find(|s| s.id == "fallback")
+            .unwrap();
+        assert!(fallback.output.rows().is_empty());
+        assert_eq!(fallback.cost_usd, 0.0);
+        // The synthesizer saw a zero count, not a template error.
+        assert!(result.output.contains("combine 0"), "{}", result.output);
     }
 
     #[tokio::test]
     async fn parallel_fan_out_with_agent_provider_uses_the_agent() {
         let wf = workflow("provider = \"claude-code\"\ncost_per_call_usd = 0.1");
-        let engine = Engine::new(Arc::new(MockLlm), Arc::new(MockAgent));
+        let engine = new_engine(Arc::new(MockLlm), Arc::new(MockAgent));
         let mut budget = BudgetTracker::new(5.0);
 
         let result = engine
@@ -1188,9 +1784,9 @@ step = "synth"
 
         let fan = result.step_results.iter().find(|s| s.id == "fan").unwrap();
         assert!(
-            fan.output.contains("agent[look into alpha]"),
+            fan.text().contains("agent[look into alpha]"),
             "agent provider should route to the agent mock: {}",
-            fan.output
+            fan.text()
         );
         // Two items pre-charged at the declared cost_per_call_usd.
         assert!((fan.cost_usd - 0.2).abs() < 1e-9);
@@ -1263,7 +1859,7 @@ step = "synth"
             in_flight: std::sync::atomic::AtomicUsize::new(0),
             peak: std::sync::atomic::AtomicUsize::new(0),
         });
-        let engine = Engine::new(
+        let engine = new_engine(
             Arc::clone(&probe) as Arc<dyn LlmProvider>,
             Arc::new(MockAgent),
         );
@@ -1306,7 +1902,7 @@ step = "synth"
     async fn agent_fan_out_reconciles_to_reported_actual_cost() {
         // Estimated $0.10/call but reported $0.07, so both should settle on 2 x 0.07.
         let wf = workflow("provider = \"claude-code\"\ncost_per_call_usd = 0.1");
-        let engine = Engine::new(Arc::new(MockLlm), Arc::new(MockAgentWithCost));
+        let engine = new_engine(Arc::new(MockLlm), Arc::new(MockAgentWithCost));
         let mut budget = BudgetTracker::new(5.0);
 
         let result = engine
@@ -1344,7 +1940,7 @@ step = "only"
 "#,
         )
         .unwrap();
-        let engine = Engine::new(Arc::new(MockLlm), Arc::new(MockAgent));
+        let engine = new_engine(Arc::new(MockLlm), Arc::new(MockAgent));
         // A budget far below any real call cost: the single step must overshoot.
         let mut budget = BudgetTracker::new(1e-9);
 
@@ -1383,7 +1979,7 @@ step = "synth"
 "#,
         )
         .unwrap();
-        let engine = Engine::new(Arc::new(MockLlm), Arc::new(MockAgent));
+        let engine = new_engine(Arc::new(MockLlm), Arc::new(MockAgent));
         let mut budget = BudgetTracker::new(0.10);
 
         let result = engine
@@ -1392,7 +1988,7 @@ step = "synth"
             .expect("workflow should succeed with the expensive step skipped");
 
         let plan = result.step_results.iter().find(|s| s.id == "plan").unwrap();
-        assert!(plan.output.contains("SKIPPED"), "{}", plan.output);
+        assert!(plan.text().contains("SKIPPED"), "{}", plan.text());
         assert_eq!(plan.cost_usd, 0.0);
 
         // The output step still ran for real on the partial input.
@@ -1401,7 +1997,7 @@ step = "synth"
             .iter()
             .find(|s| s.id == "synth")
             .unwrap();
-        assert!(synth.output.contains("researched"), "{}", synth.output);
+        assert!(synth.text().contains("researched"), "{}", synth.text());
         // Only synth spent money, and it stayed within budget.
         assert!(budget.spent_usd > 0.0 && budget.spent_usd <= budget.limit_usd);
     }
@@ -1410,7 +2006,7 @@ step = "synth"
     #[tokio::test]
     async fn subscription_agent_spend_is_notional_and_never_trips_the_budget() {
         let wf = workflow("provider = \"claude-code\"\ncost_per_call_usd = 0.30");
-        let engine = Engine::new(Arc::new(MockLlm), Arc::new(MockSubscriptionAgent));
+        let engine = new_engine(Arc::new(MockLlm), Arc::new(MockSubscriptionAgent));
         let mut budget = BudgetTracker::new(1.00);
 
         let result = engine
@@ -1437,7 +2033,7 @@ step = "synth"
     #[tokio::test]
     async fn metered_agent_spend_still_counts_against_the_budget() {
         let wf = workflow("provider = \"claude-code\"\ncost_per_call_usd = 0.30");
-        let engine = Engine::new(Arc::new(MockLlm), Arc::new(MockAgentWithCost));
+        let engine = new_engine(Arc::new(MockLlm), Arc::new(MockAgentWithCost));
         let mut budget = BudgetTracker::new(5.0);
 
         let result = engine
@@ -1469,11 +2065,47 @@ step = "only"
         .expect("test workflow TOML should parse")
     }
 
+    // Distinguishable from MockAgent output, so routing tests can tell who ran.
+    struct MockNamedAgent(&'static str);
+
+    #[async_trait]
+    impl AgentProvider for MockNamedAgent {
+        async fn run(&self, _request: AgentRequest) -> crate::Result<AgentResponse> {
+            Ok(AgentResponse {
+                output: format!("via[{}]", self.0),
+                duration: Duration::from_millis(1),
+                cost_usd: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn steps_route_to_the_provider_they_name() {
+        let wf = agent_only_workflow("provider = \"cursor\"\ncost_per_call_usd = 0.01");
+        let engine = new_agents_only(Arc::new(MockAgent))
+            .with_agent("cursor", Arc::new(MockNamedAgent("cursor")));
+        let mut budget = BudgetTracker::new(5.0);
+
+        let result = engine.run(&wf, &HashMap::new(), &mut budget).await.unwrap();
+        assert!(result.output.contains("via[cursor]"), "{}", result.output);
+    }
+
+    #[tokio::test]
+    async fn unregistered_provider_names_fall_back_to_the_default_agent() {
+        let wf = agent_only_workflow("provider = \"claude-code\"\ncost_per_call_usd = 0.01");
+        let engine = new_agents_only(Arc::new(MockAgent))
+            .with_agent("cursor", Arc::new(MockNamedAgent("cursor")));
+        let mut budget = BudgetTracker::new(5.0);
+
+        let result = engine.run(&wf, &HashMap::new(), &mut budget).await.unwrap();
+        assert!(result.output.contains("agent["), "{}", result.output);
+    }
+
     // What lets `flux run` work with ANTHROPIC_API_KEY unset and billing via the CLI login.
     #[tokio::test]
     async fn agents_only_engine_runs_without_an_llm_client() {
         let wf = agent_only_workflow("provider = \"claude-code\"\ncost_per_call_usd = 0.01");
-        let engine = Engine::agents_only(Arc::new(MockAgent));
+        let engine = new_agents_only(Arc::new(MockAgent));
         let mut budget = BudgetTracker::new(5.0);
 
         let result = engine
@@ -1492,7 +2124,7 @@ step = "only"
     async fn agents_only_engine_rejects_a_step_that_needs_the_api() {
         // No provider means the direct API, which is unavailable here.
         let wf = agent_only_workflow("");
-        let engine = Engine::agents_only(Arc::new(MockAgent));
+        let engine = new_agents_only(Arc::new(MockAgent));
         let mut budget = BudgetTracker::new(5.0);
 
         let err = engine

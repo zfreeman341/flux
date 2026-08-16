@@ -33,7 +33,7 @@ pub struct RunArgs {
 
     /// Read an input from a file as key=path; may be repeated.
     /// A bare path (no '=') maps to key "input".
-    /// Example: --input-file notes=~/.flux-private/data/notes.md
+    /// Example: --input-file notes=~/research/notes.md
     #[arg(long = "input-file")]
     pub input_files: Vec<String>,
 
