@@ -85,6 +85,9 @@ pub struct StepResult {
     pub duration: Duration,
 }
 
+/// Characters of step output kept in a run artifact file.
+const ARTIFACT_OUTPUT_CAP: usize = 200_000;
+
 impl StepResult {
     /// The prose form of this step's output, for run artifacts and assertions.
     pub fn text(&self) -> String {
@@ -92,7 +95,19 @@ impl StepResult {
     }
 
     /// The per-step debug artifact: prompt, output, and cost/timing metadata.
+    ///
+    /// Output is capped: a fetch step can hold hundreds of megabytes of JSON,
+    /// and a debug file that size helps nobody.
     pub fn to_markdown(&self) -> String {
+        let full = self.text();
+        let output = match full.char_indices().nth(ARTIFACT_OUTPUT_CAP) {
+            Some((byte, _)) => format!(
+                "{}\n\n[output truncated: {} bytes total]",
+                &full[..byte],
+                full.len()
+            ),
+            None => full,
+        };
         format!(
             "# {id}\n\nModel: `{model}`  \nTokens: {input_t} in / {output_t} out  \nCost: ${cost:.4}  \nDuration: {dur:.1}s\n\n## Prompt\n\n{prompt}\n\n## Output\n\n{output}\n",
             id = self.id,
@@ -102,7 +117,7 @@ impl StepResult {
             cost = self.cost_usd,
             dur = self.duration.as_secs_f64(),
             prompt = self.prompt,
-            output = self.text(),
+            output = output,
         )
     }
 }

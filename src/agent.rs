@@ -49,6 +49,13 @@ impl CliAgentProvider {
             "claude",
             vec![
                 "-p".to_string(),
+                // Pinned: otherwise the CLI inherits whatever model the calling
+                // session or its last interactive use selected, which may not be
+                // one a print-mode call can use. FLUX_CLAUDE_MODEL overrides it.
+                format!(
+                    "--model={}",
+                    std::env::var("FLUX_CLAUDE_MODEL").unwrap_or_else(|_| "sonnet".to_string())
+                ),
                 // Must be --flag=value; the variadic space form swallows the task string.
                 "--allowedTools=WebFetch,WebSearch".to_string(),
                 // Wraps the reply in an envelope carrying total_cost_usd.
@@ -169,7 +176,17 @@ impl AgentProvider for CliAgentProvider {
         }
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let (text, cost_usd) = parse_agent_output(&stdout);
+        let (text, cost_usd, is_error) = parse_agent_output(&stdout);
+
+        // The claude CLI can exit 0 with `is_error: true` (a bad model, an auth
+        // problem). Its "result" is then an error message, not an answer.
+        if is_error {
+            return Err(FluxError::Agent(format!(
+                "'{}' reported an error: {}",
+                self.binary,
+                text.trim()
+            )));
+        }
 
         // A zero-length answer is never a real answer; cursor-agent produces one
         // (exit 0, silent) when it chokes on input, and accepting it poisons
@@ -194,17 +211,18 @@ impl AgentProvider for CliAgentProvider {
 ///
 /// Untyped on purpose: only two fields matter, and an envelope change should not break
 /// a workflow.
-fn parse_agent_output(stdout: &str) -> (String, Option<f64>) {
+fn parse_agent_output(stdout: &str) -> (String, Option<f64>, bool) {
     let trimmed = stdout.trim();
     let Ok(parsed) = serde_json::from_str::<serde_json::Value>(trimmed) else {
-        return (trimmed.to_string(), None);
+        return (trimmed.to_string(), None, false);
     };
 
     let cost = parsed.get("total_cost_usd").and_then(|v| v.as_f64());
+    let is_error = parsed.get("is_error").and_then(|v| v.as_bool()) == Some(true);
     match parsed.get("result").and_then(|v| v.as_str()) {
-        Some(text) => (text.to_string(), cost),
+        Some(text) => (text.to_string(), cost, is_error),
         // Keep the raw envelope rather than losing the output silently.
-        None => (trimmed.to_string(), cost),
+        None => (trimmed.to_string(), cost, is_error),
     }
 }
 
@@ -215,7 +233,7 @@ mod tests {
     #[test]
     fn parses_claude_json_envelope() {
         let stdout = r#"{"type":"result","subtype":"success","result":"the answer","total_cost_usd":0.123,"num_turns":3}"#;
-        let (text, cost) = parse_agent_output(stdout);
+        let (text, cost, _) = parse_agent_output(stdout);
         assert_eq!(text, "the answer");
         assert_eq!(cost, Some(0.123));
     }
@@ -223,15 +241,23 @@ mod tests {
     #[test]
     fn json_without_result_field_keeps_envelope_and_cost() {
         let stdout = r#"{"total_cost_usd":0.5,"weird":"shape"}"#;
-        let (text, cost) = parse_agent_output(stdout);
+        let (text, cost, _) = parse_agent_output(stdout);
         assert!(text.contains("weird"));
         assert_eq!(cost, Some(0.5));
     }
 
     #[test]
     fn plain_text_falls_back_with_no_cost() {
-        let (text, cost) = parse_agent_output("  just some text output\n");
+        let (text, cost, _) = parse_agent_output("  just some text output\n");
         assert_eq!(text, "just some text output");
         assert_eq!(cost, None);
+    }
+
+    #[test]
+    fn error_envelope_is_flagged_even_though_the_cli_exited_zero() {
+        let stdout = r#"{"type":"result","is_error":true,"result":"There's an issue with the selected model","total_cost_usd":0}"#;
+        let (text, _, is_error) = parse_agent_output(stdout);
+        assert!(is_error);
+        assert!(text.contains("selected model"));
     }
 }

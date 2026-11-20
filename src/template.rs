@@ -26,13 +26,24 @@ impl FanItem {
         }
     }
 
-    /// Labels a record by its most name-like field, falling back to compact JSON.
+    /// Labels a record by its most name-like field, else its first string
+    /// field, else compact JSON. Capped, because a label is for logs and section
+    /// headers and a row can carry kilobytes of text.
     pub fn from_record(row: Value) -> Self {
-        let label = ["name", "title", "id"]
+        let named = ["label", "name", "title", "id"]
             .iter()
-            .find_map(|k| row.get(*k).and_then(Value::as_str))
+            .find_map(|k| row.get(*k).and_then(Value::as_str));
+        let first_string = || {
+            row.as_object()
+                .and_then(|o| o.values().find_map(Value::as_str))
+        };
+        let label: String = named
+            .or_else(first_string)
             .map(str::to_string)
-            .unwrap_or_else(|| row.to_string());
+            .unwrap_or_else(|| row.to_string())
+            .chars()
+            .take(80)
+            .collect();
         Self { label, value: row }
     }
 }
@@ -149,6 +160,14 @@ mod tests {
         .unwrap();
         assert_eq!(rendered, "GET https://example.com/acme");
         assert_eq!(item.label, "Acme");
+    }
+
+    #[test]
+    fn record_labels_fall_back_to_a_string_field_and_stay_short() {
+        let item = FanItem::from_record(serde_json::json!({"n": 3, "city": "Lisbon"}));
+        assert_eq!(item.label, "Lisbon");
+        let long = FanItem::from_record(serde_json::json!({"n": "x".repeat(500)}));
+        assert_eq!(long.label.chars().count(), 80);
     }
 
     #[test]
